@@ -1,0 +1,139 @@
+[project]
+requires-python = ">= 3.12"
+
+[tool.coverage.report]
+omit = [
+    "*/migrations/*.py",
+    "*wsgi.py",
+    "env/*",
+    "manage.py",
+    "node_modules/*",
+    "privaterelay/locales/*",
+]
+exclude_also = [
+    # Skip code that is only evaluated by static type checkers like pyright and mypy
+    "if TYPE_CHECKING:",
+    # Skip abstract methods
+    "raise NotImplementedError",
+]
+
+[tool.coverage.run]
+relative_files = true
+source_dirs = ["."]
+
+[tool.django-stubs]
+django_settings_module = "privaterelay.settings"
+
+[tool.mypy]
+exclude = "env"
+mypy_path = "$MYPY_CONFIG_FILE_DIR/mypy_stubs"
+plugins = ["mypy_django_plugin.main"]
+python_version = "3.12"
+show_error_codes = true
+strict = true
+
+# Disable these strict checks
+# Order is the recommended enabling order, from highest to lowest priority,
+# from mypy doc "Using mypy with an existing codebase"
+disallow_subclassing_any = false
+disallow_any_generics = false
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+ignore_missing_imports = true
+module = [
+    "allauth.account.*",
+    "allauth.core.*",
+    "allauth.socialaccount.*",
+    "boto3",
+    "botocore.config",
+    "botocore.exceptions",
+    "codetiming",
+    "csp.constants",
+    "csp.middleware",
+    "debug_toolbar",
+    "dj_database_url",
+    "django_filters.*",
+    "django_ftl",
+    "django_ftl.bundles",
+    "googlecloudprofiler",
+    "ipware",
+    "jwcrypto",
+    "jwcrypto.jwe",
+    "jwcrypto.jwk",
+    "kinto_http",
+    "kinto_http.patch_type",
+    "markus",
+    "markus.main",
+    "markus.testing",
+    "markus.utils",
+    "oauthlib.oauth2.rfc6749.errors",
+    "requests_oauthlib",
+    "silk",
+    "twilio.base.exceptions",
+    "twilio.base.instance_resource",
+    "twilio.request_validator",
+    "twilio.rest",
+    "vobject",
+    "waffle",
+    "waffle.models",
+    "waffle.testutils",
+    "whitenoise.middleware",
+    "whitenoise.storage",
+]
+
+[tool.paul-mclendahand]
+# Creates a PR that combines several dependabot PRs
+# https://github.com/willkg/paul-mclendahand
+github_project = "fx-private-relay"
+github_user = "mozilla"
+main_branch = "main"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "privaterelay.settings"
+python_files = "tests.py test_*.py *_tests.py"
+norecursedirs = ".git .local extension frontend node_modules"
+testpaths = ["api", "emails", "phones", "privaterelay"]
+
+[tool.ruff.lint]
+select = [
+    "S",  # flake8-bandit
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+    "W",  # pycodestyle warnings
+]
+extend-safe-fixes = [
+    # E711 Comparison to `None` should be `cond is / is not None`
+    # Changes '== None' to 'is None'
+    "E711",
+    # E712 Avoid equality comparisons to True / False
+    # Changes '== True' to 'is True'
+    "E712",
+    # UP031 Use format specifiers instead of percent format
+    "UP031",
+]
+
+[tool.ruff.lint.isort]
+section-order = [
+    "future",
+    "standard-library",
+    "django",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.isort.sections]
+"django" = ["django"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore line length in generated file
+"privaterelay/glean/server_events.py" = ["E501"]
+# S101: Allow assert in tests, since it is correct usage for pytest
+# S105: Allow hardcoded passwords in tests
+# S311: Allow pseudo-random generators in tests
+"**/tests/*_tests.py" = ["S101", "S105", "S311"]
+"**/tests/utils.py" = ["S101", "S311"]

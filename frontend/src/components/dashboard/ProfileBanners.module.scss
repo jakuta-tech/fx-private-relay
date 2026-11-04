@@ -1,0 +1,12 @@
+@use "~@mozilla-protocol/core/protocol/css/includes/lib" as *;
+@use "../../styles/color";
+
+.profile-banners {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-xl;
+}
+
+.bundle-logo {
+  min-width: 120px;
+}

@@ -1,0 +1,108 @@
+name: Relay e2e tests
+on:
+  schedule:
+    - cron: 0 8 * * *
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        default: stage
+        type: string
+      suite:
+        description: Test suite to run
+        required: false
+        default: relay-only
+        type: string
+    secrets:
+      E2E_TEST_ACCOUNT_FREE:
+        required: true
+      E2E_TEST_ACCOUNT_PASSWORD:
+        required: true
+      E2E_TEST_ACCOUNT_PREMIUM:
+        required: true
+      E2E_TEST_BASE_URL:
+        required: true
+      FXA_CI_SECRET:
+        required: true
+      FXA_PROD_CI_SECRET:
+        required: false 
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to run the e2e against
+        required: true
+        default: stage
+        type: choice
+        options:
+          - stage
+          - prod
+          - dev
+      suite:
+        description: Test suite to run
+        required: false
+        default: full
+        type: choice
+        options:
+          - relay-only
+          - full
+jobs:
+  relaye2e:
+    name: ${{ inputs.suite == 'relay-only' && 'Relay e2e relay-only suite' || 'Relay e2e full suite' }}
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: frontend/package.json
+          cache: npm
+      - name: Install Node dependencies
+        run: npm install
+      - name: Install Playwright Browsers
+        run: |
+          npm install -D @playwright/test --with-deps
+          npx playwright install
+      - name: Run Playwright tests
+        run: |
+          npm run test:${{ inputs.suite || 'relay-only' }}:${{ inputs.environment || 'stage' }}
+        env:
+          E2E_TEST_ACCOUNT_FREE: ${{ secrets.E2E_TEST_ACCOUNT_FREE }}
+          E2E_TEST_ACCOUNT_PASSWORD: ${{ secrets.E2E_TEST_ACCOUNT_PASSWORD }}
+          E2E_TEST_ACCOUNT_PREMIUM: ${{ secrets.E2E_TEST_ACCOUNT_PREMIUM }}
+          E2E_TEST_BASE_URL: ${{ secrets.E2E_TEST_BASE_URL }}
+          FXA_CI_SECRET: ${{ secrets.FXA_CI_SECRET }}
+          FXA_PROD_CI_SECRET: ${{ secrets.FXA_PROD_CI_SECRET }}
+      - name: Send GitHub Action trigger data to Slack workflow
+        id: slack
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        if: failure()
+        with:
+          webhook: ${{ secrets.SLACK_GHA_FAILURES_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: "*Link to job:* *<https://github.com/mozilla/fx-private-relay/actions/runs/${{ github.run_id }}|Relay e2e tests>*"
+              - type: divider
+              - type: section
+                fields:
+                  - type: mrkdwn
+                    text: "*Workflow:*\n ${{ github.workflow }}"
+                  - type: mrkdwn
+                    text: "*Status:*\n ${{ job.status }}"
+              - type: section
+                fields:
+                  - type: mrkdwn
+                    text: "*Environment:*\n ${{ case(inputs.environment == '', 'stage (default)', inputs.environment) }}"
+                  - type: mrkdwn
+                    text: "*Suite:*\n ${{ case(inputs.suite == '', 'full (default)', inputs.suite) }}"
+              - type: section
+                fields:
+                  - type: mrkdwn
+                    text: "*Ref:*\n ${{ github.ref }}"
+                  - type: mrkdwn
+                    text: "*Triggered by:*\n ${{ github.triggering_actor }}"

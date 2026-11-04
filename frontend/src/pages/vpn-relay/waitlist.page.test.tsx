@@ -1,0 +1,67 @@
+import { render, screen } from "@testing-library/react";
+import BundleWaitlist from "../../../src/pages/vpn-relay/waitlist.page";
+import { WaitlistPage } from "../../../src/components/waitlist/WaitlistPage";
+
+jest.mock("../../../src/components/Localized");
+
+jest.mock("../../../src/components/waitlist/WaitlistPage", () => ({
+  WaitlistPage: jest.fn(() => <div data-testid="mock-waitlist-page" />),
+}));
+
+import { byMsgId, buildMockL10n } from "../../../__mocks__/hooks/l10n";
+
+describe("BundleWaitlist page", () => {
+  const mockGetString = jest.fn();
+
+  beforeEach(() => {
+    global.useL10nImpl = () =>
+      buildMockL10n({
+        getString: mockGetString,
+      });
+
+    mockGetString.mockImplementation((id: string) => {
+      const strings: Record<string, string> = {
+        "waitlist-heading-bundle": "Bundle up with VPN and Relay",
+        "waitlist-lead-bundle": "Get notified when our privacy bundle is ready",
+        "waitlist-privacy-policy-use-bundle":
+          "We'll only use your info for bundle updates.",
+      };
+      return strings[id] ?? id;
+    });
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("renders the WaitlistPage with correct props", () => {
+    render(<BundleWaitlist />);
+
+    const props = (WaitlistPage as jest.Mock).mock.calls[0][0];
+
+    expect(props.supportedLocales).toEqual(["en", "es", "pl", "pt", "ja"]);
+    expect(props.headline).toBe("Bundle up with VPN and Relay");
+    expect(props.lead).toBe("Get notified when our privacy bundle is ready");
+    expect(props.newsletterId).toBe("relay-vpn-bundle-waitlist");
+    expect(props.legalese).toBeDefined();
+
+    expect(screen.getByTestId("mock-waitlist-page")).toBeInTheDocument();
+  });
+
+  it("renders legalese content", () => {
+    render(<BundleWaitlist />);
+    const legalese = (WaitlistPage as jest.Mock).mock.calls[0][0].legalese;
+
+    render(<>{legalese}</>);
+
+    expect(
+      screen.getByText(byMsgId("waitlist-privacy-policy-agree-2")),
+    ).toBeInTheDocument();
+
+    expect(
+      screen.getByText((content) =>
+        content.includes("We'll only use your info for bundle updates"),
+      ),
+    ).toBeInTheDocument();
+  });
+});

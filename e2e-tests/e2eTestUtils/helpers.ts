@@ -1,0 +1,257 @@
+import { APIRequestContext, Page, request } from "@playwright/test";
+
+export const ENV_EMAIL_DOMAINS = {
+  stage: "@mozmail.fxprivaterelay.nonprod.cloudops.mozgcp.net",
+  prod: "@mozmail.com",
+  dev: "@mozmail.relay-dev.allizom.org",
+  local: "@mozmail.com",
+};
+
+export const ENV_URLS = {
+  stage: "https://relay.allizom.org",
+  prod: "https://relay.firefox.com",
+  dev: "https://relay-dev.allizom.org",
+  local: process.env.SITE_ORIGIN,
+};
+
+export const ENV_MONITOR = {
+  dev: "https://monitor-stage.allizom.org/",
+  local: "https://monitor-stage.allizom.org/",
+  stage: "https://monitor-stage.allizom.org/",
+  prod: "https://monitor.mozilla.org/",
+};
+
+export const TIMEOUTS = {
+  SHORT: 2000,
+  MEDIUM: 5000,
+  LONG: 10000,
+};
+
+// Strip fxa-ci from all third-party domains to avoid leaking the
+// Fastly bypass secret. extraHTTPHeaders sends fxa-ci on ALL requests
+// (needed because page.route() can't intercept navigation requests
+// after redirects). A broad catch-all route breaks extraHTTPHeaders
+// on navigations, so we list each third-party domain explicitly.
+// FxA domains behind Fastly (accounts, api-accounts, oauth, profile
+// on *.mozaws.net or *.firefox.com) are NOT listed — they need it.
+const STRIP_FXA_CI_PATTERNS = [
+  "**/accounts-cdn*/**",
+  "**/*.sentry.io/**",
+  "**/*.stripe.com/**",
+  "**/*.stripe.network/**",
+  "**/pay.google.com/**",
+  "**/www.google-analytics.com/**",
+  "**/www.googletagmanager.com/**",
+  "**/*.paypal.com/**",
+];
+
+// Returns the appropriate FxA CI secret based on the environment.
+// Production tests use FXA_PROD_CI_SECRET, while dev/stage/local use FXA_CI_SECRET.
+export function getFxaCiSecret(): string | undefined {
+  const env = process.env.E2E_TEST_ENV;
+  if (env === "prod") {
+    if (!process.env.FXA_PROD_CI_SECRET) {
+      throw new Error("FXA_PROD_CI_SECRET is required for prod environment");
+    }
+    return process.env.FXA_PROD_CI_SECRET;
+  }
+  return process.env.FXA_CI_SECRET;
+}
+
+export async function setupFxaCiRoutes(page: Page) {
+  if (!getFxaCiSecret()) return;
+  const stripFxaCi = (route: any) => {
+    const headers = { ...route.request().headers() };
+    delete headers["fxa-ci"];
+    return route.continue({ headers });
+  };
+  for (const pattern of STRIP_FXA_CI_PATTERNS) {
+    await page.route(pattern, stripFxaCi);
+  }
+}
+
+// Default free mask limit — matches INCREASED_MAX_NUM_FREE_ALIASES in settings.py.
+// Used in test names (must be static) and as a fallback if the API fetch fails.
+export const MAX_NUM_FREE_ALIASES = 50;
+
+// Fetches the live mask limit from the runtime data API for the current environment.
+export const fetchMaxNumFreeAliases = async (
+  baseUrl: string,
+): Promise<number> => {
+  const context = await request.newContext();
+  const res = await context.get(`${baseUrl}/api/v1/runtime_data/`);
+  const data = await res.json();
+  return data.MAX_NUM_FREE_ALIASES ?? MAX_NUM_FREE_ALIASES;
+};
+
+export const getVerificationCode = async (
+  testEmail: string,
+  page: Page,
+  attempts = 10,
+) => {
+  if (attempts === 0) {
+    throw new Error("Unable to retrieve restmail data");
+  }
+
+  const context = await request.newContext();
+  const res = await context.get(`http://restmail.net/mail/${testEmail}`, {
+    failOnStatusCode: false,
+  });
+  const resJson = await res.json();
+  if (resJson.length) {
+    const verificationCode = resJson[0].headers["x-verify-short-code"];
+    return verificationCode;
+  }
+
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  return getVerificationCode(testEmail, page, attempts - 1);
+};
+
+export const deleteEmailAddressMessages = async (
+  req: APIRequestContext,
+  testEmail: string,
+) => {
+  try {
+    await req.delete(`http://restmail.net/mail/${testEmail}`);
+  } catch (err) {
+    console.error("ERROR DELETE RESTMAIL EMAIL", err);
+  }
+};
+
+const setYourPassword = async (page: Page) => {
+  await page
+    .locator("#password")
+    .fill(process.env.E2E_TEST_ACCOUNT_PASSWORD as string);
+  await page
+    .locator("#vpassword")
+    .fill(process.env.E2E_TEST_ACCOUNT_PASSWORD as string);
+  await page.locator("#age").fill("31");
+  await page
+    .locator('button:has-text("Create account")')
+    .click({ force: true });
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  await checkAuthState(page);
+};
+
+const enterConfirmationCode = async (page: Page) => {
+  const maybeVerificationCodeInput = "div.card input";
+  await page.waitForSelector(maybeVerificationCodeInput, {
+    timeout: TIMEOUTS.SHORT,
+  });
+  const confirmButton = page.locator('[type="submit"]').first();
+  const verificationCode = await getVerificationCode(
+    process.env.E2E_TEST_ACCOUNT_FREE as string,
+    page,
+  );
+  await page.locator(maybeVerificationCodeInput).fill(verificationCode);
+  await confirmButton.click({ force: true });
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  await checkAuthState(page);
+};
+
+const signIn = async (page: Page) => {
+  const signInButton = page.getByRole("button", { name: "Sign in" });
+  await signInButton.waitFor({ timeout: TIMEOUTS.SHORT });
+  await page.waitForLoadState("networkidle");
+  await page.waitForLoadState("domcontentloaded");
+  await page.getByRole("button", { name: "Sign in" }).click({ force: true });
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  await checkAuthState(page);
+};
+
+const enterYourEmail = async (page: Page) => {
+  const maybeEmailInput = 'input[name="email"]';
+  await page.waitForSelector(maybeEmailInput, { timeout: TIMEOUTS.SHORT });
+  const signInButton = page.locator('[type="submit"]').first();
+  await page
+    .locator(maybeEmailInput)
+    .fill(process.env.E2E_TEST_ACCOUNT_FREE as string);
+  await signInButton.click({ force: true });
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  await checkAuthState(page);
+};
+
+const enterYourPassword = async (page: Page) => {
+  await page
+    .locator('[type="password"]')
+    .nth(0)
+    .fill(process.env.E2E_TEST_ACCOUNT_PASSWORD as string);
+
+  // using force here due to fxa issue with playwright
+  await page.locator('[type="submit"]').first().click();
+  await page.waitForTimeout(TIMEOUTS.SHORT);
+  await checkAuthState(page);
+};
+
+export const generateRandomEmail = async () => {
+  return `${Date.now()}_tstact@restmail.net`;
+};
+
+export const setEnvVariables = async (email: string) => {
+  // set env variables
+  // stage will currently be the default
+  process.env["E2E_TEST_ENV"] = (process.env.E2E_TEST_ENV as string) ?? "stage";
+  process.env["E2E_TEST_ACCOUNT_FREE"] = email;
+  process.env["E2E_TEST_BASE_URL"] =
+    ENV_URLS[process.env.E2E_TEST_ENV as string] ?? ENV_URLS.stage;
+};
+
+interface DefaultScreenshotOpts {
+  animations?: "disabled" | "allow" | undefined;
+  maxDiffPixelRatio?: number | undefined;
+}
+
+export const defaultScreenshotOpts: Partial<DefaultScreenshotOpts> = {
+  animations: "disabled",
+  maxDiffPixelRatio: 0.04,
+};
+
+export const forceNonReactLink = async (page: Page) => {
+  /**
+   * There is a small chance you are redirected to an FxA auth page with the parameter showReactApp=true.
+   * This causes the page to look different, and our selectors for the auth page to become flaky because id's are missing.
+   */
+  const url = new URL(page.url());
+  if (url.searchParams.get("showReactApp") === "true") {
+    url.searchParams.set("showReactApp", "false");
+    await page.goto(url.toString());
+  }
+};
+
+export const checkAuthState = async (page: Page) => {
+  try {
+    await page.waitForLoadState("networkidle");
+    await page.waitForLoadState("domcontentloaded");
+
+    const authStateTitleString = await page
+      .locator("h1")
+      .first()
+      ?.textContent({ timeout: TIMEOUTS.MEDIUM });
+
+    const checkIfTitleContains = (potentialTitle: string) => {
+      return authStateTitleString?.includes(potentialTitle);
+    };
+
+    await forceNonReactLink(page);
+
+    switch (true) {
+      case checkIfTitleContains("Enter your email"):
+        await enterYourEmail(page);
+        break;
+      case checkIfTitleContains("Enter your password"):
+        await enterYourPassword(page);
+        break;
+      case checkIfTitleContains("Set your password"):
+        await setYourPassword(page);
+        break;
+      case checkIfTitleContains("Enter confirmation code"):
+        await enterConfirmationCode(page);
+        break;
+      case checkIfTitleContains("Sign in"):
+        await signIn(page);
+        break;
+      default:
+        break;
+    }
+  } catch {}
+};

@@ -1,0 +1,55 @@
+name: Push container image to MozCloud GAR
+on:
+  workflow_call:
+    inputs:
+      image_tag_metadata:
+        required: true
+        description: Metadata to append to image tag to set the environment
+        default: dev
+        type: string
+
+jobs:
+  determine-metadata:
+    name: Determine git metadata
+    runs-on: ubuntu-latest
+    outputs:
+      git_branch: ${{ steps.git_env_vars.outputs.GIT_BRANCH }}
+      git_tag: ${{ steps.git_env_vars.outputs.GIT_TAG }}
+    steps:
+      - name: Set GIT_BRANCH and GIT_TAG environment variables
+        id: git_env_vars
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ ${GITHUB_REF_TYPE} == "branch" ]]; then
+            echo "GIT_BRANCH=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo 'GIT_TAG=' >> "$GITHUB_OUTPUT"
+          elif [[ ${GITHUB_REF_TYPE} == "tag" ]]; then
+            echo 'GIT_BRANCH=' >> "$GITHUB_OUTPUT"
+            echo "GIT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    name: Build and push Docker image
+    needs: determine-metadata
+    permissions:
+      contents: read
+      id-token: write
+    # version 6.2.3
+    uses: mozilla/deploy-actions/.github/workflows/build-and-push.yml@d8b3b34029e5952a43b3ad6cd6b2036cb30fa003
+    with:
+      image_name: fx-private-relay
+      gar_name: ${{ vars.GCP_MOZCLOUD_GAR_NAME_PROD }}
+      project_id: ${{ vars.GCP_MOZCLOUD_PROJECT_ID_PROD }}
+      workload_identity_pool_project_number: ${{ vars.GCPV2_WORKLOAD_IDENTITY_POOL_PROJECT_NUMBER }}
+      image_tag_metadata: ${{ inputs.image_tag_metadata }}
+      docker_build_args: |
+        GITHUB_REPOSITORY=${{ github.repository }}
+        GITHUB_RUN_ID=${{ github.run_id }}
+        GITHUB_SERVER_URL=${{ github.server_url }}
+        GIT_BRANCH=${{ needs.determine-metadata.outputs.git_branch }}
+        GIT_SHA=${{ github.sha }}
+        GIT_TAG=${{ needs.determine-metadata.outputs.git_tag }}
+      prebuild_script: "git submodule update --init --recursive"
+      postbuild_script: "./scripts/smoketest.sh fx-private-relay"

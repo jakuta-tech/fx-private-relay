@@ -1,0 +1,71 @@
+name: Fetch latest strings from the l10n repo
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+          token: ${{ secrets.L10N_UPDATE_TOKEN }}
+          persist-credentials: false
+
+      - name: Pull & update submodules recursively
+        run: |
+          git submodule update --init --recursive
+          git submodule update --recursive --remote
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true'
+        id: create_pr
+        run: |
+          # Configure git
+          git config user.name "GitHub Actions — l10n sync"
+          git config user.email "actions@github.com"
+          
+          # Create a new branch
+          BRANCH_NAME="automated-l10n-sync-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH_NAME"
+          
+          # Commit changes
+          git add --all
+          git commit -m "Merge in latest l10n strings"
+          
+          # Push branch
+          git push origin "$BRANCH_NAME"
+          
+          # Create PR using gh CLI
+          PR_URL=$(gh pr create \
+            --title "chore: Merge in latest l10n strings" \
+            --body "Automated pull request to sync the latest localization strings from the l10n repository." \
+            --base main \
+            --head "$BRANCH_NAME")
+          
+          # Extract PR number from URL
+          PR_NUMBER=$(echo "$PR_URL" | grep -oP '\d+$')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.L10N_UPDATE_TOKEN }}
+
+      - name: Enable auto-merge
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.create_pr.outputs.pr_number
+        run: gh pr merge ${PR_NUMBER} --auto --merge
+        env:
+          GH_TOKEN: ${{ secrets.L10N_UPDATE_TOKEN }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}

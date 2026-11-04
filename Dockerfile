@@ -1,19 +1,18 @@
-FROM node:14 AS builder
-WORKDIR /app
-COPY package*.json ./
-COPY gulpfile.js ./
-COPY .eslint* ./
-COPY .stylelintrc.json ./
-COPY static ./static/
-RUN npm install
-RUN ./node_modules/.bin/gulp build
-RUN npm run lint:js -- --max-warnings=0
-RUN npm run lint:css
+FROM node:24.22.2 AS frontend
 
-FROM python:3.7.9
+WORKDIR /home/node
 
-RUN apt-get update && apt-get install -y libpq-dev
-RUN pip install --upgrade pip
+COPY package*.json .
+COPY frontend frontend
+COPY privaterelay/locales privaterelay/locales
+
+RUN npm ci --workspace frontend
+RUN npm run build --workspace frontend
+
+
+FROM python:3.12.14 AS app
+
+RUN pip install --no-cache --upgrade pip
 
 RUN groupadd --gid 10001 app && \
     useradd -g app --uid 10001 --shell /usr/sbin/nologin --create-home --home-dir /app app
@@ -23,16 +22,52 @@ WORKDIR /app
 EXPOSE 8000
 
 USER app
-COPY --from=builder --chown=app /app/static ./static
 
 COPY --chown=app ./requirements.txt /app/requirements.txt
-RUN pip install -r requirements.txt
+RUN pip install --no-cache -r requirements.txt
 COPY --chown=app . /app
+# When the user's Accept-Language is set to `fy`, Django's LocaleMiddleware
+# doesn't load `fy-NL`. This is a workaround to force the Frysian and Swedish
+# localisations to load anyway when appropriate.
+RUN ln --symbolic /app/privaterelay/locales/fy-NL/ privaterelay/locales/fy
+RUN ln --symbolic /app/privaterelay/locales/sv-SE/ privaterelay/locales/sv
+RUN ln --symbolic /app/privaterelay/locales/pt-BR/ privaterelay/locales/pt
+RUN ln --symbolic /app/privaterelay/locales/es-ES/ privaterelay/locales/es
 COPY --chown=app .env-dist /app/.env
 
-RUN mkdir -p /app/staticfiles
-RUN python manage.py collectstatic --no-input -v 2
+RUN python manage.py get_latest_email_tracker_lists --skip-checks
+RUN python manage.py get_latest_email_tracker_lists --skip-checks --tracker-level=2
+
+# Collect all staticfiles, including for apps that may be disabled
+COPY --from=frontend --chown=app /home/node/frontend/out frontend/out
+RUN PHONES_ENABLED=True \
+    API_DOCS_ENABLED=True \
+    mkdir -p /app/staticfiles && \
+    python manage.py collectstatic --no-input -v 2
+
+# These arguments change frequently so define them last
+ARG GITHUB_REPOSITORY
+ARG GITHUB_RUN_ID
+ARG GITHUB_SERVER_URL
+ARG GIT_BRANCH
+ARG GIT_SHA
+ARG GIT_TAG
+ENV GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-mozilla/fx-private-relay} \
+    GITHUB_RUN_ID=${GITHUB_RUN_ID:-unknown} \
+    GITHUB_SERVER_URL=${GITHUB_SERVER_URL:-https://github.com} \
+    GIT_BRANCH=${GIT_BRANCH:-unknown} \
+    GIT_SHA=${GIT_SHA:-unknown} \
+    GIT_TAG=${GIT_TAG:-unknown}
+
+# Create version.json with build metadata
+RUN printf '{"commit":"%s","version":"%s","source":"https://github.com/%s","build":"%s/%s/actions/runs/%s"}\n' \
+    "$GIT_SHA" \
+    "$GIT_TAG" \
+    "$GITHUB_REPOSITORY" \
+    "$GITHUB_SERVER_URL" \
+    "$GITHUB_REPOSITORY" \
+    "$GITHUB_RUN_ID" > /app/version.json
 
 ENTRYPOINT ["/app/.local/bin/gunicorn"]
 
-CMD ["--config", "gunicorn.conf", "privaterelay.wsgi:application"]
+CMD ["--config", "gunicorn.conf.py", "privaterelay.wsgi:application"]

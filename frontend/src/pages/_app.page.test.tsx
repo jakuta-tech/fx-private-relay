@@ -1,0 +1,318 @@
+import React from "react";
+// eslint-disable-next-line testing-library/no-manual-cleanup
+import { act, render, screen, cleanup } from "@testing-library/react";
+import { renderToString } from "react-dom/server";
+import { hydrateRoot } from "react-dom/client";
+import { axe } from "jest-axe";
+import type { AppProps } from "next/app";
+import { useRouter } from "next/router";
+import ReactGa from "react-ga";
+import { setMockProfileData } from "../../__mocks__/hooks/api/profile";
+import { setMockRuntimeData } from "../../__mocks__/hooks/api/runtimeData";
+
+jest.mock("next/router");
+jest.mock("../hooks/session");
+jest.mock("../hooks/metrics");
+jest.mock("../hooks/googleAnalytics");
+jest.mock("../hooks/addon");
+// `_app.page.tsx` builds both bundles at import time, before any test body runs.
+jest.mock("../functions/getL10n", () => ({
+  getL10n: jest.fn(
+    ({ deterministicLocales }: { deterministicLocales: boolean }) => ({
+      bundles: [{ locales: [deterministicLocales ? "en" : "nl"] }],
+    }),
+  ),
+}));
+jest.mock("react-ga", () => ({
+  __esModule: true,
+  default: {
+    pageview: jest.fn(),
+  },
+}));
+
+jest.mock("../../__mocks__/api/initialise", () => ({
+  initialiseApiMocks: jest.fn().mockResolvedValue(undefined),
+}));
+jest.mock("../../__mocks__/api/mockData", () => ({
+  mockIds: ["test-id-1", "test-id-2"],
+}));
+
+import MyApp from "./_app.page";
+import { useIsLoggedIn } from "../hooks/session";
+import { useMetrics } from "../hooks/metrics";
+import {
+  useGoogleAnalytics,
+  initGoogleAnalytics,
+} from "../hooks/googleAnalytics";
+import { useAddonElementWatcher } from "../hooks/addon";
+import { getL10n } from "../functions/getL10n";
+// The `useL10n` hook is mocked project-wide in jest.setup.ts, so it can't tell
+// us which bundle the provider actually holds. Hence the raw hook here:
+// eslint-disable-next-line no-restricted-imports
+import { useLocalization } from "@fluent/react";
+import type { LocalLabel } from "../hooks/localLabels";
+
+const mockedUseIsLoggedIn = useIsLoggedIn as jest.MockedFunction<
+  typeof useIsLoggedIn
+>;
+const mockedUseMetrics = useMetrics as jest.MockedFunction<typeof useMetrics>;
+const mockedUseGoogleAnalytics = useGoogleAnalytics as jest.MockedFunction<
+  typeof useGoogleAnalytics
+>;
+const mockedInitGoogleAnalytics = initGoogleAnalytics as jest.MockedFunction<
+  typeof initGoogleAnalytics
+>;
+const mockedUseAddonElementWatcher =
+  useAddonElementWatcher as jest.MockedFunction<typeof useAddonElementWatcher>;
+const mockedGetL10n = getL10n as jest.MockedFunction<typeof getL10n>;
+const mockedUseRouter = useRouter as jest.MockedFunction<typeof useRouter>;
+
+// `clearMocks` wipes these before the first test runs, so record them here.
+const l10nOptionsAtImport = mockedGetL10n.mock.calls.map(
+  ([options]) => options,
+);
+
+setMockProfileData();
+setMockRuntimeData();
+
+const MockComponent = () => <div>Test Component</div>;
+
+const createMockRouter = (pathname = "/", asPath = "/") => ({
+  pathname,
+  asPath,
+  push: jest.fn(),
+  query: {},
+  route: pathname,
+  events: { on: jest.fn(), off: jest.fn(), emit: jest.fn() },
+  isFallback: false,
+  isReady: true,
+  isPreview: false,
+  basePath: "",
+  locale: undefined,
+  locales: undefined,
+  defaultLocale: undefined,
+  isLocaleDomain: false,
+  beforePopState: jest.fn(),
+  prefetch: jest.fn(),
+  back: jest.fn(),
+  reload: jest.fn(),
+  replace: jest.fn(),
+  forward: jest.fn(),
+});
+
+const defaultAppProps: AppProps = {
+  Component: MockComponent,
+  pageProps: {},
+  router: {
+    pathname: "/",
+    route: "/",
+    query: {},
+    asPath: "/",
+    basePath: "",
+    isLocaleDomain: false,
+    push: jest.fn(),
+    replace: jest.fn(),
+    reload: jest.fn(),
+    back: jest.fn(),
+    forward: jest.fn(),
+    prefetch: jest.fn(),
+    beforePopState: jest.fn(),
+    events: {
+      on: jest.fn(),
+      off: jest.fn(),
+      emit: jest.fn(),
+    },
+    isFallback: false,
+    isReady: true,
+    isPreview: false,
+  } as unknown as AppProps["router"],
+};
+
+const waitForNextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("MyApp component", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.NEXT_PUBLIC_MOCK_API;
+
+    mockedUseIsLoggedIn.mockReturnValue("logged-out");
+    mockedUseMetrics.mockReturnValue("disabled");
+    mockedUseGoogleAnalytics.mockReturnValue(false);
+    mockedUseAddonElementWatcher.mockReturnValue({
+      present: false,
+      localLabels: [],
+      sendEvent: jest.fn(),
+    });
+    mockedUseRouter.mockReturnValue(createMockRouter());
+  });
+
+  it("passes axe accessibility testing", async () => {
+    const { baseElement } = render(<MyApp {...defaultAppProps} />);
+    const results = await act(() =>
+      axe(baseElement, {
+        rules: { region: { enabled: false } },
+      }),
+    );
+    expect(results).toHaveNoViolations();
+  }, 10000);
+
+  it("builds both l10n bundles", () => {
+    expect(l10nOptionsAtImport).toStrictEqual([
+      { deterministicLocales: true },
+      { deterministicLocales: false },
+    ]);
+  });
+
+  it("renders providers and handles component rendering", async () => {
+    const { container } = render(<MyApp {...defaultAppProps} />);
+    expect(screen.getByText("Test Component")).toBeInTheDocument();
+    // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+    const overlayProvider = container.querySelector("#overlayProvider");
+    expect(overlayProvider).toBeInTheDocument();
+    expect(overlayProvider).toHaveAttribute("id", "overlayProvider");
+  });
+
+  it("keeps the hydration render on the deterministic `en` bundle", async () => {
+    const renderedLocales: string[] = [];
+    const LocaleSpy = () => {
+      const [bundle] = [...useLocalization().l10n.bundles];
+      renderedLocales.push(bundle.locales[0]);
+      return <div>Locale spy</div>;
+    };
+    const appProps = { ...defaultAppProps, Component: LocaleSpy };
+
+    const mountPoint = document.createElement("div");
+    mountPoint.innerHTML = renderToString(<MyApp {...appProps} />);
+    document.body.appendChild(mountPoint);
+    renderedLocales.length = 0;
+
+    const root = await act(async () =>
+      hydrateRoot(mountPoint, <MyApp {...appProps} />),
+    );
+
+    // Anything but `en` first would mismatch the pre-rendered HTML.
+    expect(renderedLocales[0]).toBe("en");
+    expect(renderedLocales[renderedLocales.length - 1]).toBe("nl");
+
+    await act(async () => root.unmount());
+    mountPoint.remove();
+  });
+
+  it("handles Google Analytics initialization and pageview tracking", async () => {
+    mockedUseMetrics.mockReturnValue("enabled");
+    mockedUseGoogleAnalytics.mockReturnValue(false);
+
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(mockedInitGoogleAnalytics).toHaveBeenCalled();
+
+    cleanup();
+    jest.clearAllMocks();
+    mockedUseMetrics.mockReturnValue("disabled");
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(mockedInitGoogleAnalytics).not.toHaveBeenCalled();
+
+    cleanup();
+    jest.clearAllMocks();
+    mockedUseMetrics.mockReturnValue("enabled");
+    mockedUseGoogleAnalytics.mockReturnValue(true);
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(mockedInitGoogleAnalytics).not.toHaveBeenCalled();
+
+    cleanup();
+    jest.clearAllMocks();
+    mockedUseRouter.mockReturnValue(createMockRouter("/test", "/test"));
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(ReactGa.pageview).toHaveBeenCalledWith("/test");
+
+    cleanup();
+    jest.clearAllMocks();
+    mockedUseGoogleAnalytics.mockReturnValue(false);
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(ReactGa.pageview).not.toHaveBeenCalled();
+  });
+
+  it("strips the URL fragment from the tracker report pageview (MPP-4722)", async () => {
+    mockedUseMetrics.mockReturnValue("enabled");
+    mockedUseGoogleAnalytics.mockReturnValue(true);
+    mockedUseRouter.mockReturnValue(
+      createMockRouter(
+        "/tracker-report/",
+        '/tracker-report/#{"sender":"sender@example.test"}',
+      ),
+    );
+    render(<MyApp {...defaultAppProps} />);
+    await waitForNextTick();
+    expect(ReactGa.pageview).toHaveBeenCalledWith("/tracker-report/");
+  });
+
+  it("provides addon data context and sets element attributes based on login state", () => {
+    const mockLocalLabels: LocalLabel[] = [
+      { id: 1, mask_type: "random", description: "test" },
+    ];
+    const mockAddonData = {
+      present: true,
+      localLabels: mockLocalLabels,
+      sendEvent: jest.fn(),
+    };
+    mockedUseAddonElementWatcher.mockReturnValue(mockAddonData);
+
+    const { container } = render(<MyApp {...defaultAppProps} />);
+    expect(mockedUseAddonElementWatcher).toHaveBeenCalled();
+
+    // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+    let addonElement = container.querySelector("firefox-private-relay-addon");
+    expect(addonElement).toBeInTheDocument();
+    expect(addonElement).toHaveAttribute("data-addon-installed");
+    expect(addonElement).toHaveAttribute(
+      "data-local-labels",
+      JSON.stringify(mockLocalLabels),
+    );
+
+    cleanup();
+    mockedUseIsLoggedIn.mockReturnValue("logged-in");
+    const { container: container2 } = render(<MyApp {...defaultAppProps} />);
+    // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+    addonElement = container2.querySelector("firefox-private-relay-addon");
+    expect(addonElement).toHaveAttribute("data-user-logged-in", "True");
+
+    cleanup();
+    mockedUseIsLoggedIn.mockReturnValue("logged-out");
+    const { container: container3 } = render(<MyApp {...defaultAppProps} />);
+    // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+    addonElement = container3.querySelector("firefox-private-relay-addon");
+    expect(addonElement).toHaveAttribute("data-user-logged-in", "False");
+
+    cleanup();
+    mockedUseIsLoggedIn.mockReturnValue("unknown");
+    const { container: container4 } = render(<MyApp {...defaultAppProps} />);
+    // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+    addonElement = container4.querySelector("firefox-private-relay-addon");
+    expect(addonElement).toHaveAttribute("data-user-logged-in", "False");
+  });
+
+  it("handles MSW mock API initialization based on NEXT_PUBLIC_MOCK_API", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delete (global as any).URLSearchParams;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delete (global as any).document;
+
+    process.env.NEXT_PUBLIC_MOCK_API = "true";
+    render(<MyApp {...defaultAppProps} />);
+    expect(screen.queryByText("Test Component")).not.toBeInTheDocument();
+
+    cleanup();
+    process.env.NEXT_PUBLIC_MOCK_API = "false";
+    render(<MyApp {...defaultAppProps} />);
+    expect(screen.getByText("Test Component")).toBeInTheDocument();
+
+    cleanup();
+    delete process.env.NEXT_PUBLIC_MOCK_API;
+    render(<MyApp {...defaultAppProps} />);
+    expect(screen.getByText("Test Component")).toBeInTheDocument();
+  });
+});

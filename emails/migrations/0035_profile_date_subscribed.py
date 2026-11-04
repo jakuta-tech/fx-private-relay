@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('emails', '0034_relay_address_default_domain'),
+        ("emails", "0034_relay_address_default_domain"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='profile',
-            name='date_subscribed',
+            model_name="profile",
+            name="date_subscribed",
             field=models.DateTimeField(blank=True, null=True),
         ),
     ]

@@ -1,0 +1,9 @@
+@use "../../../styles/color";
+
+.sign-up-button {
+  color: currentColor;
+
+  &.mobile-btn {
+    display: block;
+  }
+}

@@ -10,559 +10,984 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/2.2/ref/settings/
 """
 
+from __future__ import annotations
+
+import base64
 import ipaddress
-import os, sys
-from datetime import datetime
+import os
+import sys
+from hashlib import sha256
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast, get_args
 
-from decouple import config
-import markus
-import sentry_sdk
-from sentry_sdk.integrations.django import DjangoIntegration
-
-from django.conf import settings
+from django.conf.global_settings import LANGUAGES as DEFAULT_LANGUAGES
 
 import dj_database_url
+import django_stubs_ext
+import sentry_sdk
+from csp.constants import NONCE, NONE, SELF, UNSAFE_INLINE
+from decouple import Choices, Csv, config
+from sentry_sdk.integrations.django import DjangoIntegration
+from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.types import Event, Hint
+
+from .types import CONTENT_SECURITY_POLICY_T, RELAY_CHANNEL_NAME
+
+if TYPE_CHECKING:
+    import wsgiref.headers
+
+try:
+    # Silk is a live profiling and inspection tool for the Django framework
+    # https://github.com/jazzband/django-silk
+    import silk  # noqa: F401
+
+    HAS_SILK = True
+except ImportError:
+    HAS_SILK = False
+
+try:
+    from privaterelay.glean.server_events import GLEAN_EVENT_MOZLOG_TYPE
+except ImportError:
+    # File may not be generated yet. Will be checked at initialization
+    GLEAN_EVENT_MOZLOG_TYPE = "glean-server-event"
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
+BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TMP_DIR = os.path.join(BASE_DIR, "tmp")
+STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
 
 # defaulting to blank to be production-broken by default
-SECRET_KEY = config('SECRET_KEY', None, cast=str)
+SECRET_KEY = config("SECRET_KEY", None)
+SECRET_KEY_FALLBACKS = config("SECRET_KEY_FALLBACKS", "", cast=Csv())
+SITE_ORIGIN: str | None = config("SITE_ORIGIN", None)
 
-ON_HEROKU = config('ON_HEROKU', False, cast=bool)
-DEBUG = config('DEBUG', False, cast=bool)
+ORIGIN_CHANNEL_MAP: dict[str, RELAY_CHANNEL_NAME] = {
+    "http://127.0.0.1:8000": "local",
+    "https://relay.firefox.com": "prod",
+    # GCPv2
+    "https://relay-dev.allizom.org": "dev",
+    "https://relay.allizom.org": "stage",
+}
+RELAY_CHANNEL: RELAY_CHANNEL_NAME = cast(
+    RELAY_CHANNEL_NAME,
+    config(
+        "RELAY_CHANNEL",
+        default=ORIGIN_CHANNEL_MAP.get(SITE_ORIGIN or "", "local"),
+        cast=Choices(get_args(RELAY_CHANNEL_NAME), cast=str),
+    ),
+)
+
+DEBUG = config("DEBUG", False, cast=bool)
 if DEBUG:
-    INTERNAL_IPS = config(
-        'DJANGO_INTERNAL_IPS', default=[]
+    INTERNAL_IPS = config("INTERNAL_IPS", default="", cast=Csv()) or config(
+        "DJANGO_INTERNAL_IPS", default="", cast=Csv()
     )
+IN_PYTEST: bool = "pytest" in sys.modules
+USE_SILK = DEBUG and HAS_SILK and not IN_PYTEST
+DEFAULT_EXCEPTION_REPORTER_FILTER = (
+    "privaterelay.debug.RelaySaferExceptionReporterFilter"
+)
 
 # Honor the 'X-Forwarded-Proto' header for request.is_secure()
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-SECURE_SSL_HOST = config('DJANGO_SECURE_SSL_HOST', None)
-SECURE_SSL_REDIRECT = config('DJANGO_SECURE_SSL_REDIRECT', False)
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_HOST = config("SECURE_SSL_HOST", None) or config(
+    "DJANGO_SECURE_SSL_HOST", None
+)
+SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", False, cast=bool) or config(
+    "DJANGO_SECURE_SSL_REDIRECT", False, cast=bool
+)
 SECURE_REDIRECT_EXEMPT = [
-    r'^__version__',
-    r'^__heartbeat__',
-    r'^__lbheartbeat__',
+    r"^__version__",
+    r"^__heartbeat__",
+    r"^__lbheartbeat__",
 ]
-SECURE_HSTS_SECONDS = config('DJANGO_SECURE_HSTS_SECONDS', None)
-SECURE_CONTENT_TYPE_NOSNIFF = config('DJANGO_SECURE_CONTENT_TYPE_NOSNIFF',
-                                     True)
-SECURE_BROWSER_XSS_FILTER = config('DJANGO_SECURE_BROWSER_XSS_FILTER', True)
-SESSION_COOKIE_SECURE = config(
-    'DJANGO_SESSION_COOKIE_SECURE', False, cast=bool
+SECURE_HSTS_INCLUDE_SUBDOMAINS = config(
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS", False, cast=bool
+) or config("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", False, cast=bool)
+SECURE_HSTS_PRELOAD = config("SECURE_HSTS_PRELOAD", False, cast=bool) or config(
+    "DJANGO_SECURE_HSTS_PRELOAD", False, cast=bool
 )
-# maps fxa profile hosts to respective avatar hosts for CSP
-AVATAR_IMG_SRC_MAP = {
-    'https://profile.stage.mozaws.net/v1':      [
-        'mozillausercontent.com',
-        'https://profile.stage.mozaws.net',
-    ],
-    'https://profile.accounts.firefox.com/v1':  [
-        'firefoxusercontent.com',
-        'https://profile.accounts.firefox.com',
-    ],
-}
-AVATAR_IMG_SRC = AVATAR_IMG_SRC_MAP[config(
-    'FXA_PROFILE_ENDPOINT', 'https://profile.accounts.firefox.com/v1'
-)]
-CSP_CONNECT_SRC = (
-    "'self'",
-    'https://www.google-analytics.com/',
-    'https://accounts.firefox.com',
-    'https://location.services.mozilla.com',
+SECURE_HSTS_SECONDS = config("SECURE_HSTS_SECONDS", None) or config(
+    "DJANGO_SECURE_HSTS_SECONDS", None
 )
-CSP_DEFAULT_SRC = ("'self'",)
-CSP_SCRIPT_SRC = (
-    "'self'",
-    'https://www.google-analytics.com/',
+# Default to "false" in first envvar check so that we fall back to the GCP v1 value
+SECURE_BROWSER_XSS_FILTER = config("SECURE_BROWSER_XSS_FILTER", False) or config(
+    "DJANGO_SECURE_BROWSER_XSS_FILTER", True
 )
-CSP_STYLE_SRC = ("'self'",)
-CSP_IMG_SRC = ["'self'"] + AVATAR_IMG_SRC
-REFERRER_POLICY = 'strict-origin-when-cross-origin'
+SESSION_COOKIE_SECURE = config("DJANGO_SESSION_COOKIE_SECURE", False, cast=bool)
+CSRF_COOKIE_SECURE = config("DJANGO_CSRF_COOKIE_SECURE", False, cast=bool)
 
-ALLOWED_HOSTS = []
-DJANGO_ALLOWED_HOST = config('DJANGO_ALLOWED_HOST', None)
-if DJANGO_ALLOWED_HOST:
-    ALLOWED_HOSTS += DJANGO_ALLOWED_HOST.split(',')
-DJANGO_ALLOWED_SUBNET = config('DJANGO_ALLOWED_SUBNET', None)
-if DJANGO_ALLOWED_SUBNET:
-    ALLOWED_HOSTS += [
-        str(ip) for ip in ipaddress.IPv4Network(DJANGO_ALLOWED_SUBNET)
+#
+# Setup CSP
+#
+
+BASKET_ORIGIN = config("BASKET_ORIGIN", "https://basket.mozilla.org")
+
+# maps FxA / Mozilla account profile hosts to respective hosts for CSP
+FXA_BASE_ORIGIN: str = config("FXA_BASE_ORIGIN", "https://accounts.firefox.com")
+if FXA_BASE_ORIGIN == "https://accounts.firefox.com":
+    _AVATAR_IMG_SRC = [
+        "firefoxusercontent.com",
+        "https://profile.accounts.firefox.com",
     ]
+    _ACCOUNT_CONNECT_SRC = [FXA_BASE_ORIGIN]
+else:
+    if not FXA_BASE_ORIGIN == "https://accounts.stage.mozaws.net":
+        raise ValueError(
+            "FXA_BASE_ORIGIN must be either https://accounts.firefox.com or https://accounts.stage.mozaws.net"
+        )
+    _AVATAR_IMG_SRC = [
+        "mozillausercontent.com",
+        "https://profile.stage.mozaws.net",
+    ]
+    _ACCOUNT_CONNECT_SRC = [
+        FXA_BASE_ORIGIN,
+        # fxaFlowTracker.ts will try this if runtimeData is slow
+        "https://accounts.firefox.com",
+    ]
+
+API_DOCS_ENABLED = config("API_DOCS_ENABLED", False, cast=bool) or DEBUG
+SENTRY_TEST_ENABLED = config("SENTRY_TEST_ENABLED", False, cast=bool)
+_CSP_SCRIPT_INLINE = USE_SILK
+
+# When running locally, styles might get refreshed while the server is running, so their
+# hashes would get outdated. Hence, we just allow all of them.
+_CSP_STYLE_INLINE = API_DOCS_ENABLED or RELAY_CHANNEL == "local"
+
+if API_DOCS_ENABLED:
+    _API_DOCS_CSP_IMG_SRC = ["data:", "https://cdn.redoc.ly"]
+    _API_DOCS_CSP_STYLE_SRC = ["https://fonts.googleapis.com"]
+    _API_DOCS_CSP_FONT_SRC = ["https://fonts.gstatic.com"]
+    _API_DOCS_CSP_WORKER_SRC = ["blob:"]
+else:
+    _API_DOCS_CSP_IMG_SRC = []
+    _API_DOCS_CSP_STYLE_SRC = []
+    _API_DOCS_CSP_FONT_SRC = []
+    _API_DOCS_CSP_WORKER_SRC = []
+
+# Next.js dynamically inserts the relevant styles when switching pages,
+# by injecting them as inline styles. We need to explicitly allow those styles
+# in our Content Security Policy.
+_CSP_STYLE_HASHES: list[str] = []
+if _CSP_STYLE_INLINE:
+    # 'unsafe-inline' is not compatible with hash sources
+    _CSP_STYLE_HASHES = []
+else:
+    # When running in production, we want to disallow inline styles that are
+    # not set by us, so we use an explicit allowlist with the hashes of the
+    # styles generated by Next.js.
+    _next_css_path = Path(STATIC_ROOT) / "_next" / "static" / "css"
+    for path in _next_css_path.glob("*.css"):
+        # Use sha256 hashes, to keep in sync with Chrome.
+        # When CSP rules fail in Chrome, it provides the sha256 hash that would
+        # have matched, useful for debugging.
+        content = open(path, "rb").read()
+        the_hash = base64.b64encode(sha256(content).digest()).decode()
+        _CSP_STYLE_HASHES.append(f"'sha256-{the_hash}'")
+    _CSP_STYLE_HASHES.sort()
+
+    # Add the hash for an empty string (sha256-47DEQp...)
+    # next,js injects an empty style element and then adds the content.
+    # This hash avoids a spurious CSP error.
+    empty_hash = base64.b64encode(sha256().digest()).decode()
+    _CSP_STYLE_HASHES.append(f"'sha256-{empty_hash}'")
+
+CONTENT_SECURITY_POLICY: CONTENT_SECURITY_POLICY_T = {
+    "DIRECTIVES": {
+        "default-src": [SELF],
+        "connect-src": [
+            SELF,
+            "https://*.google-analytics.com",
+            "https://*.analytics.google.com",
+            "https://*.googletagmanager.com",
+            "https://location.services.mozilla.com",
+            "https://api.stripe.com",
+            BASKET_ORIGIN,
+        ],
+        "font-src": [SELF, "https://relay.firefox.com/"],
+        "frame-src": ["https://js.stripe.com", "https://hooks.stripe.com"],
+        "img-src": [
+            SELF,
+            "https://*.google-analytics.com",
+            "https://*.googletagmanager.com",
+        ],
+        "object-src": [NONE],
+        "script-src": [
+            SELF,
+            NONCE,
+            "https://www.google-analytics.com/",
+            "https://*.googletagmanager.com",
+            "https://js.stripe.com/",
+        ],
+        "style-src": [SELF],
+        "worker-src": [SELF, "blob:"],  # TODO: remove blob: temporary fix for GA4
+    }
+}
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["connect-src"].extend(_ACCOUNT_CONNECT_SRC)
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["font-src"].extend(_API_DOCS_CSP_FONT_SRC)
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["img-src"].extend(_AVATAR_IMG_SRC)
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["img-src"].extend(_API_DOCS_CSP_IMG_SRC)
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["style-src"].extend(_API_DOCS_CSP_STYLE_SRC)
+CONTENT_SECURITY_POLICY["DIRECTIVES"]["style-src"].extend(_CSP_STYLE_HASHES)
+if _CSP_SCRIPT_INLINE:
+    CONTENT_SECURITY_POLICY["DIRECTIVES"]["script-src"].append(UNSAFE_INLINE)
+if _CSP_STYLE_INLINE:
+    CONTENT_SECURITY_POLICY["DIRECTIVES"]["style-src"].append(UNSAFE_INLINE)
+if _API_DOCS_CSP_WORKER_SRC:
+    CONTENT_SECURITY_POLICY["DIRECTIVES"]["worker-src"].extend(_API_DOCS_CSP_WORKER_SRC)
+if _CSP_REPORT_URI := config("CSP_REPORT_URI", ""):
+    CONTENT_SECURITY_POLICY["DIRECTIVES"]["report-uri"] = _CSP_REPORT_URI
+
+REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+ALLOWED_HOSTS: list[str] = []
+DJANGO_ALLOWED_HOSTS = config("ALLOWED_HOSTS", "", cast=Csv()) or config(
+    "DJANGO_ALLOWED_HOST", "", cast=Csv()
+)
+
+if DJANGO_ALLOWED_HOSTS:
+    ALLOWED_HOSTS += DJANGO_ALLOWED_HOSTS
+ALLOWED_SUBNET = config("ALLOWED_SUBNET", None) or config("DJANGO_ALLOWED_SUBNET", None)
+if ALLOWED_SUBNET:
+    ALLOWED_HOSTS += [str(ip) for ip in ipaddress.IPv4Network(ALLOWED_SUBNET)]
 
 
 # Get our backing resource configs to check if we should install the app
-ADMIN_ENABLED = config('ADMIN_ENABLED', False, cast=bool)
+ADMIN_ENABLED = config("ADMIN_ENABLED", False, cast=bool)
 
 
-AWS_REGION = config('AWS_REGION', None)
-AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID', None)
-AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY', None)
-AWS_SNS_TOPIC = config('AWS_SNS_TOPIC', None)
-AWS_SNS_KEY_CACHE = config('AWS_SNS_KEY_CACHE', 'default')
-AWS_SES_CONFIGSET = config('AWS_SES_CONFIGSET', None)
-AWS_SQS_QUEUE_URL = config('AWS_SQS_QUEUE_URL', None)
+AWS_REGION: str | None = config("AWS_REGION", None)
+AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID", None)
+AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY", None)
+AWS_SNS_TOPIC = set(config("AWS_SNS_TOPIC", "", cast=Csv()))
+AWS_SNS_KEY_CACHE = config("AWS_SNS_KEY_CACHE", "default")
+AWS_SES_CONFIGSET: str | None = config("AWS_SES_CONFIGSET", None)
+AWS_SQS_EMAIL_QUEUE_URL = config("AWS_SQS_EMAIL_QUEUE_URL", None)
+AWS_SQS_EMAIL_DLQ_URL = config("AWS_SQS_EMAIL_DLQ_URL", None)
 
-RELAY_FROM_ADDRESS = config('RELAY_FROM_ADDRESS', None)
-SITE_ORIGIN = config('SITE_ORIGIN', None)
-GOOGLE_ANALYTICS_ID = config('GOOGLE_ANALYTICS_ID', None)
-INCLUDE_VPN_BANNER = config('INCLUDE_VPN_BANNER', False, cast=bool)
-RECRUITMENT_BANNER_LINK = config('RECRUITMENT_BANNER_LINK', None)
-RECRUITMENT_BANNER_TEXT = config('RECRUITMENT_BANNER_TEXT', None)
-RECRUITMENT_EMAIL_BANNER_TEXT = config('RECRUITMENT_EMAIL_BANNER_TEXT', None)
-RECRUITMENT_EMAIL_BANNER_LINK = config('RECRUITMENT_EMAIL_BANNER_LINK', None)
+RELAY_FROM_ADDRESS: str = config("RELAY_FROM_ADDRESS", "")
+GOOGLE_ANALYTICS_ID = config("GOOGLE_ANALYTICS_ID", None)
+GA4_MEASUREMENT_ID = config("GA4_MEASUREMENT_ID", None)
+GOOGLE_APPLICATION_CREDENTIALS: str = config("GOOGLE_APPLICATION_CREDENTIALS", "")
+GOOGLE_CLOUD_PROFILER_CREDENTIALS_B64: str = config(
+    "GOOGLE_CLOUD_PROFILER_CREDENTIALS_B64", ""
+)
+RECRUITMENT_BANNER_LINK = config("RECRUITMENT_BANNER_LINK", None)
+RECRUITMENT_BANNER_TEXT = config("RECRUITMENT_BANNER_TEXT", None)
+RECRUITMENT_EMAIL_BANNER_TEXT = config("RECRUITMENT_EMAIL_BANNER_TEXT", None)
+RECRUITMENT_EMAIL_BANNER_LINK = config("RECRUITMENT_EMAIL_BANNER_LINK", None)
 
-TWILIO_ACCOUNT_SID = config('TWILIO_ACCOUNT_SID', None)
-TWILIO_AUTH_TOKEN = config('TWILIO_AUTH_TOKEN', None)
+PHONES_ENABLED: bool = config("PHONES_ENABLED", False, cast=bool)
+PHONES_NO_CLIENT_CALLS_IN_TEST = False  # Override in tests that do not test clients
+TWILIO_ACCOUNT_SID: str | None = config("TWILIO_ACCOUNT_SID", None)
+TWILIO_AUTH_TOKEN: str | None = config("TWILIO_AUTH_TOKEN", None)
+TWILIO_MAIN_NUMBER: str | None = config("TWILIO_MAIN_NUMBER", None)
+TWILIO_SMS_APPLICATION_SID: str | None = config("TWILIO_SMS_APPLICATION_SID", None)
+TWILIO_MESSAGING_SERVICE_SID: list[str] = config(
+    "TWILIO_MESSAGING_SERVICE_SID", "", cast=Csv()
+)
+TWILIO_TEST_ACCOUNT_SID: str | None = config("TWILIO_TEST_ACCOUNT_SID", None)
+TWILIO_TEST_AUTH_TOKEN: str | None = config("TWILIO_TEST_AUTH_TOKEN", None)
+TWILIO_ALLOWED_COUNTRY_CODES = {
+    code.upper()
+    for code in config("TWILIO_ALLOWED_COUNTRY_CODES", "US,CA,PR", cast=Csv())
+}
+TWILIO_NEEDS_10DLC_CAMPAIGN = {
+    code.upper() for code in config("TWILIO_NEEDS_10DLC_CAMPAIGN", "US,PR", cast=Csv())
+}
+MAX_MINUTES_TO_VERIFY_REAL_PHONE: int = config(
+    "MAX_MINUTES_TO_VERIFY_REAL_PHONE", 5, cast=int
+)
+MAX_TEXTS_PER_BILLING_CYCLE: int = config("MAX_TEXTS_PER_BILLING_CYCLE", 75, cast=int)
+MAX_MINUTES_PER_BILLING_CYCLE: int = config(
+    "MAX_MINUTES_PER_BILLING_CYCLE", 50, cast=int
+)
+DAYS_PER_BILLING_CYCLE = config("DAYS_PER_BILLING_CYCLE", 30, cast=int)
+MAX_DAYS_IN_MONTH = 31
 
-STATSD_ENABLED = config('DJANGO_STATSD_ENABLED', False, cast=bool)
-STATSD_HOST = config('DJANGO_STATSD_HOST', '127.0.0.1')
-STATSD_PORT = config('DJANGO_STATSD_PORT', '8125')
-STATSD_PREFIX = config('DJANGO_STATSD_PREFIX', 'fx-private-relay')
+STATSD_DEBUG = config("STATSD_DEBUG", False, cast=bool)
+STATSD_ENABLED: bool = (
+    config("STATSD_ENABLED", False, cast=bool)
+    or config("DJANGO_STATSD_ENABLED", False, cast=bool)
+    or STATSD_DEBUG
+)
+STATSD_HOST = config("STATSD_HOST", "") or config("DJANGO_STATSD_HOST", "127.0.0.1")
 
-SERVE_ADDON = config('SERVE_ADDON', None)
+STATSD_PORT = config("STATSD_PORT", "") or config("DJANGO_STATSD_PORT", "8125")
+STATSD_PREFIX = config("STATSD_PREFIX", "") or config(
+    "DJANGO_STATSD_PREFIX", "firefox_relay"
+)
+
+SERVE_ADDON = config("SERVE_ADDON", None)
 
 # Application definition
 INSTALLED_APPS = [
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.sites',
-
-    'django_gulp',
-
-    'django.contrib.staticfiles',
-
-    'django_ftl.apps.DjangoFtlConfig',
-
-    'dockerflow.django',
-
-    'allauth',
-    'allauth.account',
-    'allauth.socialaccount',
-    'allauth.socialaccount.providers.fxa',
-
-    'rest_framework',
-    'rest_framework.authtoken',
-
-    'privaterelay.apps.PrivateRelayConfig',
+    "whitenoise.runserver_nostatic",
+    "django.contrib.staticfiles",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.sites",
+    "django_filters",
+    "django_ftl.apps.DjangoFtlConfig",
+    "dockerflow.django",
+    "allauth",
+    "allauth.account",
+    "allauth.socialaccount",
+    "allauth.socialaccount.providers.fxa",
+    "rest_framework",
+    "rest_framework.authtoken",
+    "corsheaders",
+    "csp",
+    "waffle",
+    "privaterelay.apps.PrivateRelayConfig",
+    "api.apps.ApiConfig",
 ]
+
+if API_DOCS_ENABLED:
+    INSTALLED_APPS += [
+        "drf_spectacular",
+        "drf_spectacular_sidecar",
+    ]
 
 if DEBUG:
     INSTALLED_APPS += [
-        'debug_toolbar',
-        'drf_yasg',
+        "debug_toolbar",
     ]
+
+if USE_SILK:
+    INSTALLED_APPS.append("silk")
 
 if ADMIN_ENABLED:
     INSTALLED_APPS += [
-        'django.contrib.admin',
+        "django.contrib.admin",
     ]
 
 if AWS_SES_CONFIGSET and AWS_SNS_TOPIC:
     INSTALLED_APPS += [
-        'emails.apps.EmailsConfig',
+        "emails.apps.EmailsConfig",
     ]
 
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+if PHONES_ENABLED:
     INSTALLED_APPS += [
-        'phones.apps.PhonesConfig',
+        "phones.apps.PhonesConfig",
     ]
 
 
-# statsd middleware has to be first to catch errors in everything else
-def _get_initial_middleware():
-    if STATSD_ENABLED:
-        return [
-            'privaterelay.middleware.ResponseMetrics',
-        ]
-    return []
+MIDDLEWARE = ["privaterelay.middleware.ResponseMetrics"]
 
-MIDDLEWARE = _get_initial_middleware()
-
+if USE_SILK:
+    MIDDLEWARE.append("silk.middleware.SilkyMiddleware")
 if DEBUG:
-    MIDDLEWARE += [
-        'debug_toolbar.middleware.DebugToolbarMiddleware',
-    ]
+    MIDDLEWARE.append("debug_toolbar.middleware.DebugToolbarMiddleware")
 
 MIDDLEWARE += [
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
-
+    "django.middleware.security.SecurityMiddleware",
+    "privaterelay.middleware.EagerNonceCSPMiddleware",
+    "privaterelay.middleware.RedirectRootIfLoggedIn",
+    "privaterelay.middleware.RelayStaticFilesMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "privaterelay.middleware.AddRelayClientPlatformToRequest",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django.middleware.locale.LocaleMiddleware",
+    "allauth.account.middleware.AccountMiddleware",
     "django_ftl.middleware.activate_from_request_language_code",
-
-    'csp.middleware.CSPMiddleware',
-    'django_referrer_policy.middleware.ReferrerPolicyMiddleware',
-    'dockerflow.django.middleware.DockerflowMiddleware',
-
-    'privaterelay.middleware.FxAToRequest',
-    'privaterelay.middleware.AddDetectedCountryToResponseHeaders',
-    'privaterelay.middleware.StoreFirstVisit',
+    "django_referrer_policy.middleware.ReferrerPolicyMiddleware",
+    "dockerflow.django.middleware.DockerflowMiddleware",
+    "waffle.middleware.WaffleMiddleware",
+    "privaterelay.middleware.AddDetectedCountryToRequestAndResponseHeaders",
+    "privaterelay.middleware.StoreFirstVisit",
+    "privaterelay.middleware.GleanApiAccessMiddleware",
 ]
 
-ROOT_URLCONF = 'privaterelay.urls'
+ROOT_URLCONF = "privaterelay.urls"
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [
-            os.path.join(BASE_DIR, 'privaterelay', 'templates'),
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [
+            os.path.join(BASE_DIR, "privaterelay", "templates"),
         ],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.debug',
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
-
-                'emails.context_processors.relay_from_domain',
-                'privaterelay.context_processors.django_settings',
-                'privaterelay.context_processors.common',
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
 ]
 
-RELAY_FIREFOX_DOMAIN = config('RELAY_FIREFOX_DOMAIN', 'relay.firefox.com', cast=str)
-MOZMAIL_DOMAIN = config('MOZMAIL_DOMAIN', 'mozmail.com', cast=str)
-MAX_NUM_FREE_ALIASES = config('MAX_NUM_FREE_ALIASES', 5, cast=int)
-PREMIUM_PROD_ID = config('PREMIUM_PROD_ID', '', cast=str)
-PREMIUM_PRICE_ID_OVERRIDE = config('PREMIUM_PRICE_ID_OVERRIDE', '', cast=str)
-PREMIUM_PLAN_ID_MATRIX = {
-    "chf": {
-        "de": {
-            "id": "price_1JmRM0JNcmPzuWtRzCJ2LQHP",
-            "price": "CHF 1.00",
-        },
-        "fr": {
-            "id": "price_1JmRFrJNcmPzuWtROOs10fKh",
-            "price": "CHF 1.00",
-        },
-        "it": {
-            "id": "price_1JmREHJNcmPzuWtRxo7MoT58",
-            "price": "CHF 1.00",
-        },
-    },
-    "euro": {
-        "at": {
-            "id": "price_1JmRTDJNcmPzuWtRnJavIXXX",
-            "price": "0,99 €",
-        },
-        "de": {
-            "id": "price_1JmRTDJNcmPzuWtRnJavIXXX",
-            "price": "0,99 €",
-        },
-        "en": {
-            "id": "price_1JmRCQJNcmPzuWtRprMnmtax",
-            "price": "0,99 €",
-        },
-        "es": {
-            "id": "price_1JmRPSJNcmPzuWtRVvkEkVbS",
-            "price": "0,99 €",
-        },
-        "fr": {
-            "id": "price_1JmRU4JNcmPzuWtRRhu1FhiQ",
-            "price": "0,99 €",
-        },
-        "it": {
-            "id": "price_1JmRQLJNcmPzuWtRGs76IkUY",
-            "price": "0,99 €",
-        },
-        "nl": {
-            "id": "price_1JmROfJNcmPzuWtR6od8OfDW",
-            "price": "0,99 €",
-        },
-        "ie": {
-            "id": "price_1JmRCQJNcmPzuWtRprMnmtax",
-            "price": "0,99 €",
-        },
-    },
-    "usd": {
-        "en": {
-            "id": "price_1JmRSRJNcmPzuWtRN9MG5cBy",
-            "price": "$0.99"
-        }
-    }
-}
-PREMIUM_PLAN_COUNTRY_LANG_MAPPING = {
-    # Austria
-    "at": {
-        "de": PREMIUM_PLAN_ID_MATRIX["euro"]["de"]
-    },
-    # Belgium
-    "be": {
-        "fr": PREMIUM_PLAN_ID_MATRIX["euro"]["fr"],
-        "de": PREMIUM_PLAN_ID_MATRIX["euro"]["de"],
-        "nl": PREMIUM_PLAN_ID_MATRIX["euro"]["nl"],
-    },
-    # Switzerland
-    "ch": {
-        "fr": PREMIUM_PLAN_ID_MATRIX["chf"]["fr"],
-        "de": PREMIUM_PLAN_ID_MATRIX["chf"]["de"],
-        "it": PREMIUM_PLAN_ID_MATRIX["chf"]["it"],
-    },
-    # Germany
-    "de": {
-        "de": PREMIUM_PLAN_ID_MATRIX["euro"]["de"],
-    },
-    # Spain
-    "es": {
-        "es": PREMIUM_PLAN_ID_MATRIX["euro"]["es"],
-    },
-    # France
-    "fr": {
-        "fr": PREMIUM_PLAN_ID_MATRIX["euro"]["fr"],
-    },
-    # Ireland
-    "ie": {
-        "en": PREMIUM_PLAN_ID_MATRIX["euro"]["en"],
-    },
-    # Italy
-    "it": {
-        "it": PREMIUM_PLAN_ID_MATRIX["euro"]["it"],
-    },
-    # Netherlands
-    "nl": {
-        "nl": PREMIUM_PLAN_ID_MATRIX["euro"]["nl"],
-    },
-    "us": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-    "gb": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-    "ca": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-    "nz": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-    "my": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-    "sg": {
-        "en": PREMIUM_PLAN_ID_MATRIX["usd"]["en"],
-    },
-}
-
-SUBSCRIPTIONS_WITH_UNLIMITED = config(
-    'SUBSCRIPTIONS_WITH_UNLIMITED', default=''
+RELAY_FIREFOX_DOMAIN: str = config("RELAY_FIREFOX_DOMAIN", "relay.firefox.com")
+MOZMAIL_DOMAIN: str = config("MOZMAIL_DOMAIN", "mozmail.com")
+# A particular scope that we require OAuth applications to have
+RELAY_SCOPE: str = config(
+    "RELAY_SCOPE", "https://identity.mozilla.com/apps/relay", cast=str
 )
-PREMIUM_RELEASE_DATE = config('PREMIUM_RELEASE_DATE', '2021-10-27 17:00:00+00:00', cast=str)
-PREMIUM_RELEASE_DATE = datetime.fromisoformat(PREMIUM_RELEASE_DATE)
+MAX_NUM_FREE_ALIASES: int = config("MAX_NUM_FREE_ALIASES", 5, cast=int)
+INCREASED_MAX_NUM_FREE_ALIASES: int = config(
+    "INCREASED_MAX_NUM_FREE_ALIASES", 50, cast=int
+)
+PERIODICAL_PREMIUM_PROD_ID: str = config("PERIODICAL_PREMIUM_PROD_ID", "")
+PHONE_PROD_ID = config("PHONE_PROD_ID", "")
+BUNDLE_PROD_ID = config("BUNDLE_PROD_ID", "")
+MEGABUNDLE_PROD_ID = config("MEGABUNDLE_PROD_ID", "prod_SFb8iVuZIOPREe")
 
-DOMAIN_REGISTRATION_MODAL = config('DOMAIN_REGISTRATION_MODAL', False, cast=bool)
-MAX_ONBOARDING_AVAILABLE = config('MAX_ONBOARDING_AVAILABLE', 0, cast=int)
+SUBSCRIPTIONS_WITH_UNLIMITED: list[str] = config(
+    "SUBSCRIPTIONS_WITH_UNLIMITED", default="", cast=Csv()
+)
+SUBSCRIPTIONS_WITH_PHONE: list[str] = config(
+    "SUBSCRIPTIONS_WITH_PHONE", default="", cast=Csv()
+)
+SUBSCRIPTIONS_WITH_VPN: list[str] = config(
+    "SUBSCRIPTIONS_WITH_VPN", default="", cast=Csv()
+)
 
-MAX_ADDRESS_CREATION_PER_DAY = config('MAX_ADDRESS_CREATION_PER_DAY', 100, cast=int)
-MAX_REPLIES_PER_DAY = config('MAX_REPLIES_PER_DAY', 100, cast=int)
-PREMIUM_FEATURE_PAUSED_DAYS = config('ACCOUNT_PREMIUM_FEATURE_PAUSED_DAYS', 1, cast=int)
+SUBSCRIPTIONS_THAT_MEGABUNDLE_PROVIDES: list[str] = config(
+    "SUBSCRIPTIONS_THAT_MEGABUNDLE_PROVIDES", default="", cast=Csv()
+)
 
-SOFT_BOUNCE_ALLOWED_DAYS = config('SOFT_BOUNCE_ALLOWED_DAYS', 1, cast=int)
-HARD_BOUNCE_ALLOWED_DAYS = config('HARD_BOUNCE_ALLOWED_DAYS', 30, cast=int)
+MAX_ONBOARDING_AVAILABLE = config("MAX_ONBOARDING_AVAILABLE", 0, cast=int)
+MAX_ONBOARDING_FREE_AVAILABLE = config("MAX_ONBOARDING_FREE_AVAILABLE", 3, cast=int)
 
-WSGI_APPLICATION = 'privaterelay.wsgi.application'
+MAX_ADDRESS_CREATION_PER_DAY: int = config(
+    "MAX_ADDRESS_CREATION_PER_DAY", 100, cast=int
+)
+MAX_REPLIES_PER_DAY: int = config("MAX_REPLIES_PER_DAY", 100, cast=int)
+MAX_FORWARDED_PER_DAY: int = config("MAX_FORWARDED_PER_DAY", 1000, cast=int)
+MAX_FORWARDED_EMAIL_SIZE_PER_DAY: int = config(
+    "MAX_FORWARDED_EMAIL_SIZE_PER_DAY", 1_000_000_000, cast=int
+)
+PREMIUM_FEATURE_PAUSED_DAYS: int = config(
+    "ACCOUNT_PREMIUM_FEATURE_PAUSED_DAYS", 1, cast=int
+)
+
+SOFT_BOUNCE_ALLOWED_DAYS: int = config("SOFT_BOUNCE_ALLOWED_DAYS", 1, cast=int)
+HARD_BOUNCE_ALLOWED_DAYS: int = config("HARD_BOUNCE_ALLOWED_DAYS", 30, cast=int)
+
+WSGI_APPLICATION = "privaterelay.wsgi.application"
 
 # Database
-# https://docs.djangoproject.com/en/2.2/ref/settings/#databases
+# https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
-DATABASES = {
-    'default': dj_database_url.config(
-        default="sqlite:///%s" % os.path.join(BASE_DIR, 'db.sqlite3')
-    )
-}
+DATABASE_URL = config(
+    "DATABASE_URL", default="sqlite:///{}".format(os.path.join(BASE_DIR, "db.sqlite3"))
+)
+DATABASES = {"default": dj_database_url.parse(DATABASE_URL)}
+# Optionally set a test database name.
+# This is useful for forcing an on-disk database for SQLite.
+TEST_DB_NAME = config("TEST_DB_NAME", "")
+if TEST_DB_NAME:
+    DATABASES["default"]["TEST"] = {"NAME": TEST_DB_NAME}
 
-REDIS_URL = config('REDIS_URL', '', cast=str)
+REDIS_URL = config("REDIS_URL", "")
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
-            "OPTIONS": {
-                "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            }
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
         }
     }
-    SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
-    SESSION_CACHE_ALIAS = 'default'
+    SESSION_ENGINE = "django.contrib.sessions.backends.cache"
+    SESSION_CACHE_ALIAS = "default"
+elif RELAY_CHANNEL == "local":
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
+    }
 
 # Password validation
 # https://docs.djangoproject.com/en/2.2/ref/settings/#auth-password-validators
 # only needed when admin UI is enabled
 if ADMIN_ENABLED:
+    _DJANGO_PWD_VALIDATION = "django.contrib.auth.password_validation"  # noqa: E501, S105 (long line, possible password)
     AUTH_PASSWORD_VALIDATORS = [
-        {
-            'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-        },
-        {
-            'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-        },
-        {
-            'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-        },
-        {
-            'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-        },
+        {"NAME": _DJANGO_PWD_VALIDATION + ".UserAttributeSimilarityValidator"},
+        {"NAME": _DJANGO_PWD_VALIDATION + ".MinimumLengthValidator"},
+        {"NAME": _DJANGO_PWD_VALIDATION + ".CommonPasswordValidator"},
+        {"NAME": _DJANGO_PWD_VALIDATION + ".NumericPasswordValidator"},
     ]
 
 
 # Internationalization
 # https://docs.djangoproject.com/en/2.2/topics/i18n/
 
-LANGUAGE_CODE = 'en'
+LANGUAGE_CODE = "en"
 
-# Mozilla l10n uses 'zh-tw' and 'zh-cn' language codes, so we need to add those
-# to LANGUAGES so Django's LocaleMiddleware can find them.
-LANGUAGES = settings.LANGUAGES + [
-    ('zh-tw', 'Chinese'),
-    ('zh-cn', 'Chinese'),
+# Mozilla l10n directories use lang-locale language codes,
+# so we need to add those to LANGUAGES so Django's LocaleMiddleware
+# can find them.
+LANGUAGES = DEFAULT_LANGUAGES + [
+    ("zh-tw", "Chinese"),
+    ("zh-cn", "Chinese"),
+    ("es-es", "Spanish"),
+    ("pt-pt", "Portuguese"),
+    ("skr", "Saraiki"),
 ]
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = "UTC"
 
 USE_I18N = True
 
-USE_L10N = True
 
 USE_TZ = True
 
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/2.2/howto/static-files/
-
-STATIC_URL = '/static/'
-
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-
 STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, 'static'),
+    os.path.join(BASE_DIR, "frontend/out"),
 ]
+# Static files (the front-end in /frontend/)
+# https://whitenoise.evans.io/en/stable/django.html#using-whitenoise-with-webpack-browserify-latest-js-thing
+STATIC_URL = "/"
+if DEBUG:
+    # In production, we run collectstatic to index all static files.
+    # However, when running locally, we want to automatically pick up
+    # all files spewed out by `npm run watch` in /frontend/out,
+    # and we're fine with the performance impact of that.
+    WHITENOISE_ROOT = os.path.join(BASE_DIR, "frontend/out")
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "privaterelay.storage.RelayStaticFilesStorage",
+    },
+}
 
-# for dev statics, we use django-gulp during runserver.
-# for stage/prod statics, we run "gulp build" in docker.
-# so, squelch django-gulp in prod so it doesn't run gulp during collectstatic:
-if not ON_HEROKU:
-    GULP_PRODUCTION_COMMAND = ''
+# Relay does not support user-uploaded files
+MEDIA_ROOT = None
+MEDIA_URL = None
+
+WHITENOISE_INDEX_FILE = True
+
+
+# See
+# https://whitenoise.evans.io/en/stable/django.html#WHITENOISE_ADD_HEADERS_FUNCTION
+# Intended to ensure that the homepage does not get cached in our CDN,
+# so that the `RedirectRootIfLoggedIn` middleware can kick in for logged-in
+# users.
+def set_index_cache_control_headers(
+    headers: wsgiref.headers.Headers, path: str, url: str
+) -> None:
+    if DEBUG:
+        home_path = os.path.join(BASE_DIR, "frontend/out", "index.html")
+    else:
+        home_path = os.path.join(STATIC_ROOT, "index.html")
+    if path == home_path:
+        headers["Cache-Control"] = "no-cache, public"
+
+
+WHITENOISE_ADD_HEADERS_FUNCTION = set_index_cache_control_headers
 
 SITE_ID = 1
 
 AUTHENTICATION_BACKENDS = (
-    'django.contrib.auth.backends.ModelBackend',
-    'allauth.account.auth_backends.AuthenticationBackend',
+    "django.contrib.auth.backends.ModelBackend",
+    "allauth.account.auth_backends.AuthenticationBackend",
 )
 
 SOCIALACCOUNT_PROVIDERS = {
-    'fxa': {
+    "fxa": {
         # Note: to request "profile" scope, must be a trusted Mozilla client
-        'SCOPE': ['profile'],
-        'AUTH_PARAMS': {'access_type': 'offline'},
-        'OAUTH_ENDPOINT': config('FXA_OAUTH_ENDPOINT', 'https://oauth.accounts.firefox.com/v1'),
-        'PROFILE_ENDPOINT': config('FXA_PROFILE_ENDPOINT', 'https://profile.accounts.firefox.com/v1'),
+        "SCOPE": [
+            "profile",
+            "https://identity.mozilla.com/account/subscriptions",
+            RELAY_SCOPE,
+        ],
+        "AUTH_PARAMS": {"access_type": "offline"},
+        "OAUTH_ENDPOINT": config(
+            "FXA_OAUTH_ENDPOINT", "https://oauth.accounts.firefox.com/v1"
+        ),
+        "PROFILE_ENDPOINT": config(
+            "FXA_PROFILE_ENDPOINT", "https://profile.accounts.firefox.com/v1"
+        ),
+        "VERIFIED_EMAIL": True,  # Assume FxA primary email is verified
     }
 }
 
-SOCIALACCOUNT_EMAIL_VERIFICATION = 'none'
-ACCOUNT_USERNAME_REQUIRED=False
-ACCOUNT_PRESERVE_USERNAME_CASING=False
-SOCIALACCOUNT_AUTO_SIGNUP=True
+SOCIALACCOUNT_EMAIL_VERIFICATION = "none"
+SOCIALACCOUNT_AUTO_SIGNUP = True
+SOCIALACCOUNT_LOGIN_ON_GET = True
+SOCIALACCOUNT_STORE_TOKENS = True
 
-FXA_BASE_ORIGIN = config('FXA_BASE_ORIGIN', 'https://accounts.firefox.com')
-FXA_SETTINGS_URL = config('FXA_SETTINGS_URL', f'{FXA_BASE_ORIGIN}/settings')
-FXA_SUBSCRIPTIONS_URL = config('FXA_SUBSCRIPTIONS_URL', f'{FXA_BASE_ORIGIN}/subscriptions')
-FXA_SUPPORT_URL = config('FXA_SUPPORT_URL', f'{FXA_BASE_ORIGIN}/support/')
+ACCOUNT_ADAPTER = "privaterelay.allauth.AccountAdapter"
+ACCOUNT_PRESERVE_USERNAME_CASING = False
+
+FXA_REQUESTS_TIMEOUT_SECONDS = config("FXA_REQUESTS_TIMEOUT_SECONDS", 1, cast=int)
+FXA_SETTINGS_URL = config("FXA_SETTINGS_URL", f"{FXA_BASE_ORIGIN}/settings")
+FXA_SUBSCRIPTIONS_URL = config(
+    "FXA_SUBSCRIPTIONS_URL", f"{FXA_BASE_ORIGIN}/subscriptions"
+)
+# check https://mozilla.github.io/ecosystem-platform/api#tag/Subscriptions/operation/getOauthMozillasubscriptionsCustomerBillingandsubscriptions  # noqa: E501 (line too long)
+FXA_ACCOUNTS_ENDPOINT = config(
+    "FXA_ACCOUNTS_ENDPOINT",
+    "https://api.accounts.firefox.com/v1",
+)
+FXA_SUPPORT_URL = config("FXA_SUPPORT_URL", f"{FXA_BASE_ORIGIN}/support/")
+SUBPLAT_API_ENDPOINT = config(
+    "SUBPLAT_API_ENDPOINT",
+    (
+        "https://api.payments.firefox.com/v1"
+        if FXA_BASE_ORIGIN == "https://accounts.firefox.com"
+        else "https://api.payments-next.allizom.org/v1"
+    ),
+)
+SUBPLAT3_HOST = (
+    "https://payments.firefox.com"
+    if FXA_BASE_ORIGIN == "https://accounts.firefox.com"
+    else "https://payments-next.allizom.org"
+)
+SUBPLAT3_PREMIUM_PRODUCT_KEY = config(
+    "SUBPLAT3_PREMIUM_PRODUCT_KEY", "relay-premium-127", cast=str
+)
+SUBPLAT3_PHONES_PRODUCT_KEY = config(
+    "SUBPLAT3_PHONES_PRODUCT_KEY", "relay-premium-127-phone", cast=str
+)
+SUBPLAT3_BUNDLE_PRODUCT_KEY = config(
+    "SUBPLAT3_BUNDLE_PRODUCT_KEY", "bundle-relay-vpn-dev", cast=str
+)
+SUBPLAT3_MEGABUNDLE_PRODUCT_KEY = config(
+    "SUBPLAT3_MEGABUNDLE_PRODUCT_KEY", "privacyprotectionplan", cast=str
+)
 
 LOGGING = {
-    'version': 1,
-    'formatters': {
-        'json': {
-            '()': 'dockerflow.logging.JsonLogFormatter',
-            'logger_name': 'fx-private-relay'
-        }
-    },
-    'handlers': {
-        'console_out': {
-            'level': 'DEBUG',
-            'class': 'logging.StreamHandler',
-            'stream': sys.stdout,
-            'formatter': 'json'
-        },
-        'console_err': {
-            'level': 'DEBUG',
-            'class': 'logging.StreamHandler',
-            'formatter': 'json'
+    "version": 1,
+    "filters": {
+        "request_id": {
+            "()": "dockerflow.logging.RequestIdLogFilter",
         },
     },
-    'loggers': {
-        'request.summary': {
-            'handlers': ['console_out'],
-            'level': 'DEBUG',
-        },
-        'events': {
-            'handlers': ['console_err'],
-            'level': 'ERROR',
-        },
-        'eventsinfo': {
-            'handlers': ['console_out'],
-            'level': 'INFO',
-        },
-        'abusemetrics': {
-            'handlers': ['console_out'],
-            'level': 'INFO'
+    "formatters": {
+        "json": {
+            "()": "dockerflow.logging.JsonLogFormatter",
+            "logger_name": "fx-private-relay",
         }
-    }
+    },
+    "handlers": {
+        "console_out": {
+            "level": "DEBUG",
+            "class": "logging.StreamHandler",
+            "stream": sys.stdout,
+            "formatter": "json",
+            "filters": ["request_id"],
+        },
+        "console_err": {
+            "level": "DEBUG",
+            "class": "logging.StreamHandler",
+            "formatter": "json",
+            "filters": ["request_id"],
+        },
+    },
+    "loggers": {
+        "root": {
+            "handlers": ["console_err"],
+            "level": "WARNING",
+        },
+        "request.summary": {
+            "handlers": ["console_out"],
+            "level": "DEBUG",
+            # pytest's caplog fixture requires propagate=True
+            # outside of pytest, use propagate=False to avoid double logs
+            "propagate": IN_PYTEST,
+        },
+        "events": {
+            "handlers": ["console_err"],
+            "level": "WARNING",
+            "propagate": IN_PYTEST,
+        },
+        "eventsinfo": {
+            "handlers": ["console_out"],
+            "level": "INFO",
+            "propagate": IN_PYTEST,
+        },
+        "abusemetrics": {
+            "handlers": ["console_out"],
+            "level": "INFO",
+            "propagate": IN_PYTEST,
+        },
+        "studymetrics": {
+            "handlers": ["console_out"],
+            "level": "INFO",
+            "propagate": IN_PYTEST,
+        },
+        "markus": {
+            "handlers": ["console_out"],
+            "level": "DEBUG",
+            "propagate": IN_PYTEST,
+        },
+        GLEAN_EVENT_MOZLOG_TYPE: {
+            "handlers": ["console_out"],
+            "level": "DEBUG",
+            "propagate": IN_PYTEST,
+        },
+        "dockerflow": {
+            "handlers": ["console_err"],
+            "level": "WARNING",
+            "propagate": IN_PYTEST,
+        },
+    },
 }
 
-if DEBUG:
-    DRF_RENDERERS = (
-        'rest_framework.renderers.BrowsableAPIRenderer',
-        'rest_framework.renderers.JSONRenderer',
-    )
-else:
-    DRF_RENDERERS = (
-        'rest_framework.renderers.JSONRenderer',
-    )
+DRF_RENDERERS = ["rest_framework.renderers.JSONRenderer"]
+if DEBUG and not IN_PYTEST:
+    DRF_RENDERERS += [
+        "rest_framework.renderers.BrowsableAPIRenderer",
+    ]
+
+FIRST_EMAIL_RATE_LIMIT = config("FIRST_EMAIL_RATE_LIMIT", "5/minute")
+if IN_PYTEST or RELAY_CHANNEL in ["local", "dev"]:
+    FIRST_EMAIL_RATE_LIMIT = "1000/minute"
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.TokenAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "api.authentication.FxaTokenAuthentication",
+        "rest_framework.authentication.TokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
     ],
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated'
-    ],
-    'DEFAULT_RENDERER_CLASSES': DRF_RENDERERS,
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+    "DEFAULT_RENDERER_CLASSES": DRF_RENDERERS,
+    "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
+    "EXCEPTION_HANDLER": "api.views.relay_exception_handler",
+}
+if API_DOCS_ENABLED:
+    REST_FRAMEWORK["DEFAULT_SCHEMA_CLASS"] = "drf_spectacular.openapi.AutoSchema"
+
+SPECTACULAR_SETTINGS = {
+    "SWAGGER_UI_DIST": "SIDECAR",
+    "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
+    "REDOC_DIST": "SIDECAR",
+    "TITLE": "Firefox Relay API",
+    "DESCRIPTION": (
+        "Keep your email safe from hackers and trackers. This API is built with"
+        " Django REST Framework and powers the Relay website UI, add-on,"
+        " Firefox browser, and 3rd-party app integrations."
+    ),
+    "VERSION": "1.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "PREPROCESSING_HOOKS": ["api.schema.preprocess_ignore_deprecated_paths"],
+    "SORT_OPERATIONS": "api.schema.sort_by_tag",
 }
 
+if IN_PYTEST or RELAY_CHANNEL in ["local", "dev"]:
+    _DEFAULT_PHONE_RATE_LIMIT = "1000/minute"
+else:
+    _DEFAULT_PHONE_RATE_LIMIT = "5/minute"
+PHONE_RATE_LIMIT = config("PHONE_RATE_LIMIT", _DEFAULT_PHONE_RATE_LIMIT)
+
+VCARD_RATE_LIMIT = config("VCARD_RATE_LIMIT", "10/minute")
+
+if IN_PYTEST or RELAY_CHANNEL in ["local", "dev", "stage"]:
+    _DEFAULT_PROFILE_RATE_LIMIT = "1000/minute"
+    _DEFAULT_ADDRESS_RATE_LIMIT = "1000/minute"
+else:
+    _DEFAULT_PROFILE_RATE_LIMIT = "30/minute"
+    _DEFAULT_ADDRESS_RATE_LIMIT = "30/minute"
+PROFILE_RATE_LIMIT = config("PROFILE_RATE_LIMIT", _DEFAULT_PROFILE_RATE_LIMIT)
+ADDRESS_RATE_LIMIT = config("ADDRESS_RATE_LIMIT", _DEFAULT_ADDRESS_RATE_LIMIT)
+
+# Turn on logging out on GET in development.
+# This allows `/mock/logout/` in the front-end to clear the
+# session cookie. Without this, after switching accounts in dev mode,
+# then logging out again, API requests continue succeeding even without
+# an auth token:
+ACCOUNT_LOGOUT_ON_GET = DEBUG
+
+# TODO: introduce an environment variable to control CORS_ALLOWED_ORIGINS
+# https://mozilla-hub.atlassian.net/browse/MPP-3468
+CORS_URLS_REGEX = r"^/api/"
+CORS_ALLOWED_ORIGINS = [
+    "https://vault.bitwarden.com",
+    "https://vault.bitwarden.eu",
+]
+if RELAY_CHANNEL in ["dev", "stage"]:
+    CORS_ALLOWED_ORIGINS += [
+        "https://vault.qa.bitwarden.pw",
+        "https://vault.euqa.bitwarden.pw",
+    ]
+# Allow origins for each environment to help debug cors headers
+if RELAY_CHANNEL == "local":
+    # In local dev, next runs on localhost and makes requests to /accounts/
+    CORS_ALLOWED_ORIGINS += [
+        "http://localhost:3000",
+        "http://0.0.0.0:3000",
+        "http://127.0.0.1:8000",
+    ]
+    CORS_URLS_REGEX = r"^/(api|accounts)/"
+if RELAY_CHANNEL == "dev":
+    CORS_ALLOWED_ORIGINS += [
+        "https://dev.relay.nonprod.webservices.mozgcp.net",
+        "https://relay-dev.allizom.org",
+    ]
+if RELAY_CHANNEL == "stage":
+    CORS_ALLOWED_ORIGINS += [
+        # GCP v1
+        "https://relay.allizom.org",
+        # GCP v2
+        "https://stage.relay.nonprod.webservices.mozgcp.net",
+        "https://relay.allizom.org",
+    ]
+
+CSRF_TRUSTED_ORIGINS = []
+if RELAY_CHANNEL == "local":
+    # In local development, the React UI can be served up from a different server
+    # that needs to be allowed to make requests.
+    # In production, the frontend is served by Django, is therefore on the same
+    # origin and thus has access to the same cookies.
+    CORS_ALLOW_CREDENTIALS = True
+    SESSION_COOKIE_SAMESITE = None
+    CSRF_TRUSTED_ORIGINS += [
+        "http://localhost:3000",
+        "http://0.0.0.0:3000",
+    ]
+
+SENTRY_RELEASE = config("SENTRY_RELEASE", "")
+GIT_BRANCH = config("GIT_BRANCH", "")
+GIT_SHA = config("GIT_SHA", "")
+GIT_TAG = config("GIT_TAG", "")
+
+sentry_release: str | None = None
+if SENTRY_RELEASE:
+    sentry_release = SENTRY_RELEASE
+elif GIT_TAG and GIT_TAG != "unknown":
+    sentry_release = GIT_TAG
+elif GIT_SHA and GIT_SHA != "unknown" and GIT_BRANCH and GIT_BRANCH != "unknown":
+    sentry_release = f"{GIT_BRANCH}:{GIT_SHA}"
+
+SENTRY_DEBUG = config("SENTRY_DEBUG", DEBUG, cast=bool)
+
+SENTRY_ENVIRONMENT = config("SENTRY_ENVIRONMENT", RELAY_CHANNEL)
+# Use "local" as default rather than "prod", to catch ngrok.io URLs
+if SENTRY_ENVIRONMENT == "prod" and SITE_ORIGIN != "https://relay.firefox.com":
+    SENTRY_ENVIRONMENT = "local"
+
+
+def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
+    """
+    Tags Sentry events with relay client platform from the X-Relay-Client header.
+
+    See https://docs.sentry.io/platforms/python/configuration/filtering/#using-before-send
+    """
+    from privaterelay.utils import parse_relay_client_platform
+
+    request_data = cast(dict[str, Any], event.get("request", {}))
+    headers = cast(dict[str, Any], request_data.get("headers", {}))
+    relay_client_header = str(headers.get("X-Relay-Client", ""))
+
+    if relay_client_header:
+        os_value, platform_value = parse_relay_client_platform(relay_client_header)
+
+        if os_value:
+            if "tags" not in event:
+                event["tags"] = {}
+            event["tags"]["relay_client_platform"] = os_value
+
+            if "contexts" not in event:
+                event["contexts"] = {}
+            event["contexts"]["relay_client"] = {
+                "header_value": relay_client_header,
+                "os": os_value,
+                "platform": platform_value,
+            }
+
+    return event
+
+
 sentry_sdk.init(
-    dsn=config('SENTRY_DSN', None),
+    dsn=config("SENTRY_DSN", None),
     integrations=[DjangoIntegration()],
-    debug=DEBUG,
-    with_locals=DEBUG
+    debug=SENTRY_DEBUG,
+    include_local_variables=DEBUG,
+    release=sentry_release,
+    environment=SENTRY_ENVIRONMENT,
+    before_send=_sentry_before_send,
+)
+# Duplicates events for unhandled exceptions, but without useful tracebacks
+ignore_logger("request.summary")
+# Security scanner attempts, no action required
+# Can be re-enabled when hostname allow list implemented at the load balancer
+ignore_logger("django.security.DisallowedHost")
+# Fluent errors, mostly when a translation is unavailable for the locale.
+# It is more effective to process these from logs using BigQuery than to track
+# as events in Sentry.
+ignore_logger("django_ftl.message_errors")
+
+if USE_SILK:
+    SILKY_PYTHON_PROFILER = True
+    SILKY_PYTHON_PROFILER_BINARY = True
+    SILKY_PYTHON_PROFILER_RESULT_PATH = ".silk-profiler"
+
+# Settings for manage.py process_emails_from_sqs
+PROCESS_EMAIL_BATCH_SIZE = config(
+    "PROCESS_EMAIL_BATCH_SIZE", 10, cast=Choices(range(1, 11), cast=int)
+)
+PROCESS_EMAIL_DELETE_FAILED_MESSAGES = config(
+    "PROCESS_EMAIL_DELETE_FAILED_MESSAGES", False, cast=bool
+)
+PROCESS_EMAIL_HEALTHCHECK_PATH = config(
+    "PROCESS_EMAIL_HEALTHCHECK_PATH", os.path.join(TMP_DIR, "healthcheck.json")
+)
+PROCESS_EMAIL_MAX_SECONDS = config("PROCESS_EMAIL_MAX_SECONDS", 0, cast=int) or None
+PROCESS_EMAIL_VERBOSITY = config(
+    "PROCESS_EMAIL_VERBOSITY", 1, cast=Choices(range(0, 4), cast=int)
+)
+PROCESS_EMAIL_VISIBILITY_SECONDS = config(
+    "PROCESS_EMAIL_VISIBILITY_SECONDS", 120, cast=int
+)
+PROCESS_EMAIL_WAIT_SECONDS = config("PROCESS_EMAIL_WAIT_SECONDS", 5, cast=int)
+PROCESS_EMAIL_HEALTHCHECK_MAX_AGE = config(
+    "PROCESS_EMAIL_HEALTHCHECK_MAX_AGE", 120, cast=int
+)
+PROCESS_EMAIL_MAX_SECONDS_PER_MESSAGE = config(
+    "PROCESS_EMAIL_MAX_SECONDS_PER_MESSAGE",
+    PROCESS_EMAIL_MAX_SECONDS or 120.0,
+    cast=float,
 )
 
-markus.configure(
-    backends=[
-        {
-            'class': 'markus.backends.datadog.DatadogMetrics',
-            'options': {
-                'statsd_host': STATSD_HOST,
-                'statsd_port': STATSD_PORT,
-                'statsd_prefix': STATSD_PREFIX,
-            }
-        }
-    ]
+# Django 3.2 switches default to BigAutoField
+DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+
+# python-dockerflow settings
+DOCKERFLOW_VERSION_CALLBACK = "privaterelay.utils.get_version_info"
+DOCKERFLOW_CHECKS = [
+    "dockerflow.django.checks.check_database_connected",
+    "dockerflow.django.checks.check_migrations_applied",
+]
+if REDIS_URL:
+    DOCKERFLOW_CHECKS.append("dockerflow.django.checks.check_redis_connected")
+DOCKERFLOW_REQUEST_ID_HEADER_NAME = config("DOCKERFLOW_REQUEST_ID_HEADER_NAME", None)
+SILENCED_SYSTEM_CHECKS = sorted(
+    set(config("DJANGO_SILENCED_SYSTEM_CHECKS", default="", cast=Csv()))
+    | {
+        # (models.W040) SQLite does not support indexes with non-key columns.
+        # RelayAddress index idx_ra_created_by_addon uses this for PostgreSQL.
+        "models.W040",
+    }
 )
+
+# django-ftl settings
+AUTO_RELOAD_BUNDLES = False  # Requires pyinotify
+
+# accounts that should not have abuse metrics
+ALLOWED_ACCOUNTS = ["relay-team+e2e@mozilla.com"]
+
+# settings for kinto / remote settings
+REMOTE_SETTINGS_SERVER = config("REMOTE_SETTINGS_SERVER", "", str)
+REMOTE_SETTINGS_AUTH = config("REMOTE_SETTINGS_AUTH", "", str)
+REMOTE_SETTINGS_BUCKET = config("REMOTE_SETTINGS_BUCKET", "", str)
+REMOTE_SETTINGS_COLLECTION = config("REMOTE_SETTINGS_COLLECTION", "", str)
+ALLOWLIST_INPUT_URL = config("ALLOWLIST_INPUT_URL", "", str)
+
+# Patching for django-types
+django_stubs_ext.monkeypatch()

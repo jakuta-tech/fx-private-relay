@@ -1,0 +1,26 @@
+name: Deploy to MozCloud environment
+on:
+  push:
+    branches: [ '**' ]
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        default: stage
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+jobs:
+  build-and-deploy-dev:
+    uses: ./.github/workflows/build-and-push-to-gar.yml
+    # Allow this to run when a push to main happens
+    # or we call the dispatch
+    if: >
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'workflow_dispatch'
+    with:
+      image_tag_metadata: ${{ inputs.environment || 'dev' }}

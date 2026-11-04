@@ -1,0 +1,43 @@
+import React from "react";
+import styles from "./SignInButton.module.scss";
+import { setCookie } from "../../../functions/cookies";
+import { getLoginUrl, useFxaFlowTracker } from "../../../hooks/fxaFlowTracker";
+import { useGaEvent } from "../../../hooks/gaEvent";
+import { useL10n } from "../../../hooks/l10n";
+import { useUtmApplier } from "../../../hooks/utmApplier";
+
+export type Props = {
+  className?: string;
+};
+
+export const SignInButton = (props: Props): React.JSX.Element => {
+  const l10n = useL10n();
+  const { flowData: signInFlowData, ref: signInRef } = useFxaFlowTracker({
+    category: "Sign In",
+    label: "nav-profile-sign-in",
+    entrypoint: "relay-sign-in-header",
+  });
+  const applyUtmParams = useUtmApplier();
+  const signInUrl = applyUtmParams(
+    getLoginUrl("relay-sign-in-header", signInFlowData),
+  );
+  const gaEvent = useGaEvent();
+
+  return (
+    <a
+      href={signInUrl}
+      ref={signInRef}
+      onClick={() => {
+        gaEvent({
+          category: "Sign In",
+          action: "Engage",
+          label: "nav-profile-sign-in",
+        });
+        setCookie("user-sign-in", "true", { maxAgeInSeconds: 60 * 60 });
+      }}
+      className={`${styles["sign-in-button"]} ${props.className ?? ""}`}
+    >
+      {l10n.getString("nav-profile-sign-in")}
+    </a>
+  );
+};

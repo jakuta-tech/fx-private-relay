@@ -1,93 +1,200 @@
-from datetime import datetime, timezone
+import base64
+import binascii
+import os
+import re
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+from django.conf import settings
+from django.http import HttpRequest, HttpResponse
+from django.shortcuts import redirect
 
 import markus
-from oauthlib.oauth2.rfc6749.errors import CustomOAuth2Error
+from csp.middleware import CSPMiddleware
+from whitenoise.middleware import WhiteNoiseMiddleware
 
-from django.contrib.auth import logout
-from django.shortcuts import redirect
-from django.urls import reverse
+from privaterelay.utils import glean_logger, parse_relay_client_platform
 
-from allauth.socialaccount.models import SocialToken
-from allauth.socialaccount.providers.fxa.views import (
-    FirefoxAccountsOAuth2Adapter
+metrics = markus.get_metrics()
+
+
+# To find all the URL paths that serve HTML which need the CSP nonce:
+# python manage.py collectstatic
+# find staticfiles -type f -name 'index.html'
+CSP_NONCE_COOKIE_PATHS = [
+    "/",
+    "/contains-tracker-warning/",
+    "/faq/",
+    "/vpn-relay/waitlist/",
+    "/accounts/settings/",
+    "/accounts/profile/",
+    "/accounts/account_inactive/",
+    "/vpn-relay-welcome/",
+    "/phone/waitlist/",
+    "/phone/",
+    "/404/",
+    "/tracker-report/",
+    "/premium/waitlist/",
+    "/premium/",
+]
+
+
+def _frontend_html_path(request_path: str) -> Path:
+    # Locally, `npm run watch` writes straight to frontend/out; elsewhere,
+    # collectstatic copies the build to STATIC_ROOT.
+    if settings.DEBUG:
+        root = Path(settings.BASE_DIR) / "frontend" / "out"
+    else:
+        root = Path(settings.STATIC_ROOT)
+    return root / request_path.strip("/") / "index.html"
+
+
+_TURBOPACK_BOOTSTRAP_RE = re.compile(
+    r'<script[^>]*>(?P<body>\(globalThis\["TURBOPACK"\].*?)</script>', re.S
 )
 
-from .views import _get_oauth2_session, update_social_token
 
-metrics = markus.get_metrics('fx-private-relay')
-
-
-class FxAToRequest:
-    def __init__(self, get_response):
-        self.get_response = get_response
-
-    def __call__(self, request):
-        if not request.user.is_authenticated:
-            return self.get_response(request)
-
-        fxa_account = (
-            request.user.socialaccount_set.filter(provider='fxa').first()
-        )
-
-        if not fxa_account:
-            return self.get_response(request)
-
-        social_token = SocialToken.objects.get(account=fxa_account)
-        # if the user's FXA access token has expired; try to get a new one
-        if social_token.expires_at < datetime.now(timezone.utc):
-            try:
-                client = _get_oauth2_session(fxa_account)
-                new_token = client.refresh_token(
-                    FirefoxAccountsOAuth2Adapter.access_token_url
-                )
-                update_social_token(social_token, new_token)
-            except CustomOAuth2Error:
-                logout(request)
-                return redirect(reverse('home'))
-
-        request.fxa_account = fxa_account
-        return self.get_response(request)
+# Cached so each HTML page is read and hashed once, not on every request.
+@lru_cache(maxsize=64)
+def _inline_script_hashes_for_file(path: Path, mtime_ns: int) -> tuple[str, ...]:
+    html = path.read_text(encoding="utf-8")
+    hashes = []
+    for match in _TURBOPACK_BOOTSTRAP_RE.finditer(html):
+        digest = sha256(match["body"].encode("utf-8")).digest()
+        hashes.append(f"'sha256-{base64.b64encode(digest).decode('ascii')}'")
+    return tuple(hashes)
 
 
-class AddDetectedCountryToResponseHeaders:
-    def __init__(self, get_response):
-        self.get_response = get_response
+def _inline_script_hashes(request_path: str) -> list[str]:
+    path = _frontend_html_path(request_path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return []
+    return list(_inline_script_hashes_for_file(path, mtime_ns))
 
-    def __call__(self, request):
-        response = self.get_response(request)
-        if 'X-Client-Region' in request.headers:
-            response['X-Detected-Client-Region'] = (
-                request.headers['X-Client-Region']
+
+class EagerNonceCSPMiddleware(CSPMiddleware):
+    # We need a nonce to use Google Tag Manager with a safe CSP:
+    # https://developers.google.com/tag-platform/security/guides/csp
+    # django-csp only includes the nonce value in the CSP header if the csp_nonce
+    # attribute is accessed:
+    # https://django-csp.readthedocs.io/en/latest/nonce.html
+    # That works for urls served by Django views that access the attribute but it
+    # doesn't work for urls that are served by views which don't access the attribute.
+    # (e.g., Whitenoise)
+    # So, to ensure django-csp includes the nonce value in the CSP header of every
+    # response, we override the default CSPMiddleware with this middleware. If the
+    # request is for one of the HTML urls, this middleware sets the request.csp_nonce
+    # attribute and adds a cookie for the React app to get the nonce value for scripts.
+    # It also adds the hash of the page's inline Turbopack bootstrap script (MPP-4803),
+    # which is already put into the static HTML at build time and so it can't carry the
+    # nonce.
+    def process_request(self, request):
+        if request.path in CSP_NONCE_COOKIE_PATHS:
+            request_nonce = binascii.hexlify(os.urandom(16)).decode("ascii")
+            request._csp_nonce = request_nonce
+
+    def process_response(self, request, response):
+        # Only fixed paths are looked up, so the request can't choose which file
+        # on disk is read and hashed.
+        if request.path in CSP_NONCE_COOKIE_PATHS:
+            script_hashes = _inline_script_hashes(request.path)
+            if script_hashes:
+                response._csp_update = {"script-src": script_hashes}
+        response = super().process_response(request, response)
+        if request.path in CSP_NONCE_COOKIE_PATHS:
+            response.set_cookie(
+                "csp_nonce", request._csp_nonce, secure=True, samesite="Strict"
             )
         return response
 
 
-def _get_metric_view_name(request):
-    if request.resolver_match:
-        view = request.resolver_match.func
-        return f'{view.__module__}.{view.__name__}'
-    return '<unknown_view>'
-
-
-class ResponseMetrics:
+class RedirectRootIfLoggedIn:
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
+        # To prevent showing a flash of the landing page when a user is logged
+        # in, use a server-side redirect to send them to the dashboard,
+        # rather than handling that on the client-side:
+        if request.path == "/" and settings.SESSION_COOKIE_NAME in request.COOKIES:
+            query_string = (
+                "?" + request.META["QUERY_STRING"]
+                if request.META["QUERY_STRING"]
+                else ""
+            )
+            return redirect("accounts/profile/" + query_string)
+
+        response = self.get_response(request)
+        return response
+
+
+class AddDetectedCountryToRequestAndResponseHeaders:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        region_key = "X-Client-Region"
+        region_dict = None
+        if region_key in request.headers:
+            region_dict = request.headers
+        if region_key in request.GET:
+            region_dict = request.GET
+        if not region_dict:
+            return self.get_response(request)
+
+        country = region_dict.get(region_key)
+        request.country = country
+        response = self.get_response(request)
+        response.country = country
+        return response
+
+
+class ResponseMetrics:
+    re_dockerflow = re.compile(r"/__(version|heartbeat|lbheartbeat)__/?$")
+
+    def __init__(self, get_response: Callable[[HttpRequest], HttpResponse]) -> None:
+        self.get_response = get_response
+        self.middleware = RelayStaticFilesMiddleware()
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        if not settings.STATSD_ENABLED:
+            return self.get_response(request)
+
         start_time = time.time()
         response = self.get_response(request)
         delta = time.time() - start_time
-
-        view_name = _get_metric_view_name(request)
-
-        metrics.timing('response', value=delta * 1000.0, tags=[
-            f'status:{response.status_code}',
-            f'view:{view_name}',
-            f'method:{request.method}',
-        ])
-
+        view_name = self._get_metric_view_name(request)
+        metrics.timing(
+            "response",
+            value=delta * 1000.0,
+            tags=[
+                f"status:{response.status_code}",
+                f"view:{view_name}",
+                f"method:{request.method}",
+            ],
+        )
         return response
+
+    def _get_metric_view_name(self, request: HttpRequest) -> str:
+        if request.resolver_match:
+            view = request.resolver_match.func
+            if hasattr(view, "view_class"):
+                # Wrapped with rest_framework.decorators.api_view
+                return f"{view.__module__}.{view.view_class.__name__}"
+            return f"{view.__module__}.{view.__name__}"
+        if match := self.re_dockerflow.match(request.path_info):
+            return f"dockerflow.django.views.{match[1]}"
+        if self.middleware.is_staticfile(request.path_info):
+            return "<static_file>"
+        return "<unknown_view>"
+
 
 class StoreFirstVisit:
     def __init__(self, get_response):
@@ -96,6 +203,123 @@ class StoreFirstVisit:
     def __call__(self, request):
         response = self.get_response(request)
         first_visit = request.COOKIES.get("first_visit")
-        if (first_visit is None and not request.user.is_anonymous):
-            response.set_cookie("first_visit", datetime.now(timezone.utc))
+        if first_visit is None and not request.user.is_anonymous:
+            response.set_cookie("first_visit", datetime.now(UTC))
         return response
+
+
+class RelayStaticFilesMiddleware(WhiteNoiseMiddleware):
+    """Customize WhiteNoiseMiddleware for Relay.
+
+    The WhiteNoiseMiddleware serves static files and sets headers. In
+    production, the files are read from staticfiles/staticfiles.json,
+    and files with hashes in the name are treated as immutable with
+    10-year cache timeouts.
+
+    This class also treats Next.js output files (already hashed) as immutable.
+    """
+
+    def immutable_file_test(self, path, url):
+        """
+        Determine whether given URL represents an immutable file (i.e. a
+        file with a hash of its contents as part of its name) which can
+        therefore be cached forever.
+
+        All files outputted by next.js are hashed and immutable
+        """
+        if not url.startswith(self.static_prefix):
+            return False
+        name = url[len(self.static_prefix) :]
+        if name.startswith("_next/static/"):
+            return True
+        else:
+            return super().immutable_file_test(path, url)
+
+    def is_staticfile(self, path_info: str) -> bool:
+        """
+        Returns True if this file is served by the middleware.
+
+        This uses the logic from whitenoise.middleware.WhiteNoiseMiddleware.__call__:
+        https://github.com/evansd/whitenoise/blob/220a98894495d407424e80d85d49227a5cf97e1b/src/whitenoise/middleware.py#L117-L124
+        """
+        if self.autorefresh:
+            static_file = self.find_file(path_info)
+        else:
+            static_file = self.files.get(path_info)
+        return static_file is not None
+
+    PRESERVE_QS_KEYS = set(
+        (
+            "utm_source",
+            "utm_campaign",
+            "utm_medium",
+            "utm_content",
+            "utm_term",
+        )
+    )
+
+    @staticmethod
+    def serve(static_file, request):
+        """Preserve some query params when redirecting."""
+        resp = WhiteNoiseMiddleware.serve(static_file, request)
+        if (
+            resp.status_code == 302
+            and (redirect_url := resp["location"])
+            and (request_qs_params := request.GET)
+            and (
+                response_qs_params := {
+                    key: val
+                    for key, val in request_qs_params.items()
+                    if key in RelayStaticFilesMiddleware.PRESERVE_QS_KEYS
+                }
+            )
+        ):
+            redirect_url_parts = urlsplit(redirect_url)
+            new_redirect_parts = (
+                redirect_url_parts.scheme,
+                redirect_url_parts.netloc,
+                redirect_url_parts.path,
+                urlencode(response_qs_params),
+                redirect_url_parts.fragment,
+            )
+            new_redirect_url = urlunsplit(new_redirect_parts)
+            resp["Location"] = new_redirect_url
+        return resp
+
+
+class AddRelayClientPlatformToRequest:
+    """
+    Extract and parse X-Relay-Client header once for use by:
+    - Glean metrics (via RequestData)
+    - Sentry error tracking (via before_send hook)
+    - Structured logging
+
+    Adds these attributes to request:
+        - relay_client_header: Raw header value (e.g., "appservices-ios")
+        - relay_client_os: OS value (e.g., "ios", "android", "macos")
+        - relay_client_platform: platform (e.g., "mobile-ios", "desktop-macos")
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        relay_client_header = request.headers.get("X-Relay-Client", "")
+        os_value, platform_value = parse_relay_client_platform(relay_client_header)
+
+        request.relay_client_header = relay_client_header
+        request.relay_client_os = os_value
+        request.relay_client_platform = platform_value
+
+        response = self.get_response(request)
+        return response
+
+
+class GleanApiAccessMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.path.startswith("/api/"):
+            glean_logger().log_api_accessed(request)
+        return self.get_response(request)

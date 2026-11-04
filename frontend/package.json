@@ -1,0 +1,86 @@
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "license": "MPL-2.0",
+  "private": true,
+  "scripts": {
+    "dev": "NEXT_PUBLIC_DEBUG=true next dev",
+    "dev:mocked": "NEXT_PUBLIC_MOCK_API=true npm run dev",
+    "watch": "chokidar \"src/**/*\" \"next.config.js\" --initial --command=\"npm run watch_build\"",
+    "watch_build": "NEXT_PUBLIC_DEBUG=true npm run build",
+    "build": "next build",
+    "build:mocked": "NEXT_PUBLIC_MOCK_API=true NEXT_PUBLIC_DEBUG=true npm run build",
+    "start": "next start",
+    "lint": "stylelint '**/*.scss' && prettier --check './src' && eslint './src'",
+    "licensecheck": "license-checker --excludePrivatePackages --production --onlyAllow 'MPL; MIT; BSD-3-Clause; BSD-2-Clause; 0BSD; Apache-2.0; ISC; Zlib; CC0; Unlicense; WTFPL; Unicode-DFS-2016;'",
+    "test": "jest",
+    "postinstall": "msw init public/ --save"
+  },
+  "dependencies": {
+    "@fluent/bundle": "^0.19.1",
+    "@fluent/langneg": "^0.7.0",
+    "@fluent/react": "^0.15.2",
+    "@mozilla-protocol/core": "^17.0.1",
+    "@next/third-parties": "^16.4.2",
+    "@stripe/stripe-js": "^10.2.0",
+    "chokidar-cli": "^3.0.0",
+    "cldr-localenames-modern": "^45.0.0",
+    "msw": "^2.15.0",
+    "react": "19.2.7",
+    "react-aria": "^3.53.1",
+    "react-confetti": "^6.4.0",
+    "react-dom": "19.2.7",
+    "react-ga": "^3.3.1",
+    "react-intersection-observer": "^11.0.1",
+    "react-singleton-hook": "^4.0.1",
+    "react-stately": "^3.51.0",
+    "react-toastify": "^11.1.0",
+    "swr": "^2.5.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.8",
+    "@types/jest-axe": "^3.5.9",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.4",
+    "babel-jest": "^30.5.2",
+    "@eslint/compat": "^2.1.1",
+    "@eslint/js": "^10.0.0",
+    "eslint": "^10.13.0",
+    "eslint-plugin-jest-dom": "^5.10.1",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-testing-library": "^7.16.2",
+    "typescript-eslint": "^8.72.1",
+    "husky": "^9.1.7",
+    "jest": "^30.5.2",
+    "jest-axe": "^11.0.0",
+    "jest-environment-jsdom": "^30.5.2",
+    "jest-junit": "^17.0.0",
+    "license-checker": "^25.0.1",
+    "lint-staged": "^17.6.0",
+    "next": "^16.4.2",
+    "prettier": "3.9.10",
+    "raw-loader": "^4.0.2",
+    "sass": "^1.106.1",
+    "stylelint": "^17.16.0",
+    "stylelint-config-recommended-scss": "^17.0.1",
+    "stylelint-scss": "^7.4.0",
+    "typescript": "^7.0.2"
+  },
+  "volta": {
+    "node": "22.15.0",
+    "npm": "10.9.2"
+  },
+  "msw": {
+    "workerDirectory": "public"
+  },
+  "overrides": {
+    "js-yaml": "^4.1.1",
+    "@istanbuljs/load-nyc-config": {
+      "js-yaml": "^4.1.1"
+    }
+  }
+}

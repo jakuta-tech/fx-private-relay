@@ -1,0 +1,32 @@
+name: Lint Pending Translations
+on:
+  push:
+    paths:
+      - 'frontend/pendingTranslations.ftl'
+      - '.github/workflows/lint-pending-strings.yml'
+      - 'privaterelay/pending_locales/en/pending.ftl'
+    branches: [ '*' ]
+  workflow_dispatch:
+jobs:
+  linter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+          persist-credentials: false
+      - name: Set up Python 3
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          pip install -r privaterelay/locales/.github/requirements.txt
+      - name: Lint frontend pending translations
+        run: |
+          moz-fluent-lint frontend --config privaterelay/locales/.github/linter_config.yml
+      - name: Lint backend pending translations
+        run: |
+          moz-fluent-lint privaterelay/pending_locales --config privaterelay/locales/.github/linter_config.yml

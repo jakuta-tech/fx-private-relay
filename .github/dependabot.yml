@@ -1,0 +1,105 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 8
+    open-pull-requests-limit: 10
+    groups:
+      eslint:
+        patterns:
+          - "@typescript-eslint/*"
+          - "eslint*"
+        exclude-patterns:
+          - "eslint-config-next"
+      jest:
+        patterns:
+          - "babel-jest"
+          - "jest"
+          - "jest-environment-jsdom"
+      nextjs:
+        patterns:
+          - "eslint-config-next"
+          - "next"
+          - "@next/*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+      testing-library:
+        patterns:
+          - "@testing-library/dom"
+          - "@testing-library/react"
+          - "@testing-library/user-event"
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 8
+    open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "django-stubs"
+        versions:
+          # Breaks 1:1 fields
+          # error: "User" has no attribute "profile"  [attr-defined]
+          - "4.2.7"
+      - dependency-name: "djangorestframework-stubs"
+        versions:
+          # Requires django-stubs 4.2.7
+          - "3.14.5"
+    groups:
+      boto:
+        patterns:
+          - "boto3"
+          - "boto3-stubs"
+          - "botocore"
+          - "botocore-stubs"
+          - "mypy-boto3-ses"
+          - "mypy-boto3-sns"
+          - "mypy-boto3-sqs"
+          - "mypy-boto3-s3"
+      testing-libraries:
+        patterns:
+          - "coverage"
+          - "model-bakery"
+          - "pytest-cov"
+          - "pytest-django"
+          - "responses"
+      typing-stubs:
+        patterns:
+          - "django-stubs"
+          - "djangorestframework-stubs"
+          - "types-requests"
+  - package-ecosystem: "pip"
+    directory: "/.github/blender"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 8
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 8
+    groups:
+      codeql:
+        patterns:
+          - "github/codeql-action/*"
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 8
+    ignore:
+      - dependency-name: "node"
+        versions:
+          # Odd-numbered Node releases never become LTS. The node image only
+          # builds the frontend, so we only take LTS lines.
+          - "25.x"
+          - "27.x"
+          - "29.x"
